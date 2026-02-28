@@ -26,7 +26,7 @@ A persistent memory server for AI agents, implemented as an [MCP (Model Context 
 ## Installation
 
 ```bash
-git clone https://github.com/your-user/engram-mcp.git
+git clone https://github.com/Jacksini/engram-mcp.git
 cd engram-mcp
 npm install
 npm run build
