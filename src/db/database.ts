@@ -1,0 +1,1086 @@
+import Database from "better-sqlite3";
+import type { Statement } from "better-sqlite3";
+import { randomUUID } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+import { SCHEMA_SQL } from "./schema.js";
+import type {
+  Memory,
+  MemorySlim,
+  ContextSnapshot,
+  CreateMemoryInput,
+  UpdateMemoryInput,
+  BatchUpdateItem,
+  SearchMemoriesInput,
+  ListMemoriesInput,
+  SortBy,
+  ExportMemoriesInput,
+  ImportMode,
+  ImportMemoryRow,
+  ImportResult,
+  StatsResult,
+  MemoryLink,
+  RelatedMemory,
+  RelationType,
+  LinkMemoriesInput,
+  GetRelatedInput,
+  RenameTagResult,
+  ListLinksInput,
+  ListLinksResult,
+  GetGraphInput,
+  GraphResult,
+  GraphNode,
+  GraphEdge,
+  GetHistoryInput,
+  GetHistoryResult,
+  MemoryHistoryEntry,
+  RestoreMemoryInput,
+} from "../types/memory.js";
+
+
+interface MemoryRow {
+  id: string;
+  content: string;
+  category: string;
+  tags: string;
+  metadata: string;
+  created_at: string;
+  updated_at: string;
+  expires_at: string | null;
+}
+
+/** Internal row returned by link JOIN queries */
+interface LinkQueryRow extends MemoryRow {
+  relation: string;
+  link_created_at: string;
+}
+
+/** Internal row returned by memory_history queries */
+interface HistoryRow {
+  history_id: number;
+  memory_id: string;
+  operation: string;
+  content: string;
+  category: string;
+  tags: string;
+  metadata: string;
+  expires_at: string | null;
+  changed_at: string;
+  total_count?: number;
+}
+
+const DEFAULT_DB_PATH = process.env["ENGRAM_DB_PATH"] ??
+  join(homedir(), ".engram", "memories.db");
+
+export class MemoryDatabase {
+  private readonly db: Database.Database;
+  /** Absolute path to the SQLite file, or ':memory:' for in-memory databases. */
+  readonly dbPath: string;
+
+  // Prepared statements cached at construction time for maximum performance
+  private readonly stmtCreate: Statement;
+  private readonly stmtGetById: Statement;
+  private readonly stmtGetByIds: Statement;
+  private readonly stmtUpdate: Statement;
+  private readonly stmtDelete: Statement;
+  private readonly stmtSnapshot: Statement;
+  private readonly stmtTagFreq: Statement;
+  private readonly stmtPurgeExpired: Statement;
+
+  // Relations (Ronda 25)
+  private readonly stmtLinkUpsert: Statement;
+  private readonly stmtUnlink: Statement;
+  private readonly stmtGetLink: Statement;
+  private readonly stmtUpdateLink: Statement;
+  private readonly stmtLinksFrom: Statement;
+  private readonly stmtLinksFromRel: Statement;
+  private readonly stmtLinksTo: Statement;
+  private readonly stmtLinksToRel: Statement;
+
+  // History statements (Ronda 28)
+  private readonly stmtHistoryCount: Statement;
+  private readonly stmtHistoryRows: Statement;
+  private readonly stmtHistoryEntry: Statement;
+
+  // listWithTotal stmts: key="${filterFlags}_${sortBy}" where flags c=category t=tag m=meta
+  // 8 filter combos × 3 sort orders = 24 prepared statements
+  private readonly listWTStmts = new Map<string, Statement>();
+  // searchWithTotal stmts: key="${filterFlags}" where flags c=category t=tag m=meta
+  // 8 filter combos, each with optional date range, always FTS rank-ordered
+  private readonly searchWTStmts = new Map<string, Statement>();
+
+  constructor(dbPath: string = DEFAULT_DB_PATH) {
+    this.dbPath = dbPath;
+    if (dbPath !== ":memory:") {
+      mkdirSync(dirname(dbPath), { recursive: true });
+    }
+    this.db = new Database(dbPath);
+    this.initialize();
+
+    // Pre-compile all fixed statements; RETURNING avoids an extra SELECT round-trip
+    this.stmtCreate = this.db.prepare(
+      `INSERT INTO memories (id, content, category, tags, metadata, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       RETURNING *`
+    );
+    this.stmtGetById = this.db.prepare(
+      "SELECT * FROM memories WHERE id = ?"
+    );
+    // json_each allows a pre-compiled IN query with a JSON array parameter
+    this.stmtGetByIds = this.db.prepare(
+      "SELECT * FROM memories WHERE id IN (SELECT value FROM json_each(?)) ORDER BY created_at DESC, rowid DESC"
+    );
+    this.stmtUpdate = this.db.prepare(
+      `UPDATE memories
+       SET content = ?, category = ?, tags = ?, metadata = ?, expires_at = ?, updated_at = datetime('now')
+       WHERE id = ?
+       RETURNING *`
+    );
+    this.stmtDelete = this.db.prepare(
+      "DELETE FROM memories WHERE id = ?"
+    );
+
+    // Window-function query: category count + row rank in a single pass.
+    // SQLite supports window functions since 3.25.0 (2018); better-sqlite3 bundles 3.46+.
+    // rowid as tiebreaker guarantees stable ordering when created_at ties (sub-second inserts).
+    this.stmtSnapshot = this.db.prepare(
+      `SELECT id, content, category, tags,
+              COUNT(*) OVER (PARTITION BY category) AS cat_count,
+              ROW_NUMBER() OVER (PARTITION BY category ORDER BY created_at DESC, rowid DESC) AS rn
+       FROM memories
+       WHERE (expires_at IS NULL OR expires_at > datetime('now'))`
+    );
+
+    this.stmtTagFreq = this.db.prepare(
+      "SELECT json_each.value AS tag FROM memories, json_each(memories.tags) WHERE (expires_at IS NULL OR expires_at > datetime('now'))"
+    );
+
+    this.stmtPurgeExpired = this.db.prepare(
+      "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at <= datetime('now') RETURNING id"
+    );
+
+    // Relations statements
+    const LINKS_SEL_FROM = `
+      SELECT m.*, l.relation, l.created_at AS link_created_at
+      FROM memory_links l JOIN memories m ON l.to_id = m.id
+      WHERE l.from_id = ?`;
+    const LINKS_SEL_TO = `
+      SELECT m.*, l.relation, l.created_at AS link_created_at
+      FROM memory_links l JOIN memories m ON l.from_id = m.id
+      WHERE l.to_id = ?`;
+
+    this.stmtLinkUpsert = this.db.prepare(
+      "INSERT OR REPLACE INTO memory_links (from_id, to_id, relation) VALUES (?, ?, ?) RETURNING *"
+    );
+    this.stmtUnlink = this.db.prepare(
+      "DELETE FROM memory_links WHERE from_id = ? AND to_id = ? RETURNING from_id"
+    );
+    this.stmtGetLink = this.db.prepare(
+      "SELECT * FROM memory_links WHERE from_id = ? AND to_id = ?"
+    );
+    this.stmtUpdateLink = this.db.prepare(
+      "UPDATE memory_links SET relation = ? WHERE from_id = ? AND to_id = ? RETURNING *"
+    );
+    this.stmtLinksFrom    = this.db.prepare(`${LINKS_SEL_FROM} ORDER BY l.created_at DESC`);
+    this.stmtLinksFromRel = this.db.prepare(`${LINKS_SEL_FROM} AND l.relation = ? ORDER BY l.created_at DESC`);
+    this.stmtLinksTo      = this.db.prepare(`${LINKS_SEL_TO} ORDER BY l.created_at DESC`);
+    this.stmtLinksToRel   = this.db.prepare(`${LINKS_SEL_TO} AND l.relation = ? ORDER BY l.created_at DESC`);
+
+    // History statements (Ronda 28)
+    this.stmtHistoryCount = this.db.prepare(
+      "SELECT COUNT(*) AS cnt FROM memory_history WHERE memory_id = ?"
+    );
+    this.stmtHistoryRows = this.db.prepare(
+      "SELECT * FROM memory_history WHERE memory_id = ? ORDER BY changed_at DESC, history_id DESC LIMIT ? OFFSET ?"
+    );
+    this.stmtHistoryEntry = this.db.prepare(
+      "SELECT * FROM memory_history WHERE history_id = ? AND memory_id = ?"
+    );
+
+    // Alias for this.db.prepare — keeps the Map-building loop concise
+    const p = (sql: string) => this.db.prepare(sql);
+
+    const EXPIRES_ALIVE   = "(expires_at IS NULL OR expires_at > datetime('now'))";
+    const EXPIRES_ALIVE_M = "(m.expires_at IS NULL OR m.expires_at > datetime('now'))";
+    const TAG_EXISTS  = "EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?)";
+    const FTS_TAG     = "EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?)";
+    const WT_SEL      = "SELECT *, COUNT(*) OVER () AS total_count";
+    const META_COND   = "json_extract(metadata, '$.' || ?) = ?";
+    const META_COND_M = "json_extract(m.metadata, '$.' || ?) = ?";
+    // Pass null to disable date filters; ISO string to enable
+    // Each date axis has two bounds: after (>=) and before (<=).
+    // Param order per bound pair: col_after, col_after, col_before, col_before
+    const DATE_COND   = "(? IS NULL OR created_at >= ?) AND (? IS NULL OR created_at <= ?) AND (? IS NULL OR updated_at >= ?) AND (? IS NULL OR updated_at <= ?)";
+    const DATE_COND_M = "(? IS NULL OR m.created_at >= ?) AND (? IS NULL OR m.created_at <= ?) AND (? IS NULL OR m.updated_at >= ?) AND (? IS NULL OR m.updated_at <= ?)";
+
+    // Build listWithTotal: 8 filter combos × 3 sort orders = 24 entries
+    // Param order per combo: [...category?, ...tag?, ...meta_key+val?, ca, ca, cb, cb, ua, ua, ub, ub, limit, offset]
+    const SORT_ORDERS: Record<string, string> = {
+      created_at_desc: "ORDER BY created_at DESC, rowid DESC",
+      created_at_asc:  "ORDER BY created_at ASC,  rowid ASC",
+      updated_at_desc: "ORDER BY updated_at DESC, rowid DESC",
+    };
+    for (const [sk, order] of Object.entries(SORT_ORDERS)) {
+      this.listWTStmts.set(`_${sk}`,   p(`${WT_SEL} FROM memories WHERE ${EXPIRES_ALIVE} AND ${DATE_COND} ${order} LIMIT ? OFFSET ?`));
+      this.listWTStmts.set(`c_${sk}`,  p(`${WT_SEL} FROM memories WHERE ${EXPIRES_ALIVE} AND category = ? AND ${DATE_COND} ${order} LIMIT ? OFFSET ?`));
+      this.listWTStmts.set(`t_${sk}`,  p(`${WT_SEL} FROM memories WHERE ${EXPIRES_ALIVE} AND ${TAG_EXISTS} AND ${DATE_COND} ${order} LIMIT ? OFFSET ?`));
+      this.listWTStmts.set(`ct_${sk}`, p(`${WT_SEL} FROM memories WHERE ${EXPIRES_ALIVE} AND category = ? AND ${TAG_EXISTS} AND ${DATE_COND} ${order} LIMIT ? OFFSET ?`));
+      this.listWTStmts.set(`m_${sk}`,  p(`${WT_SEL} FROM memories WHERE ${EXPIRES_ALIVE} AND ${META_COND} AND ${DATE_COND} ${order} LIMIT ? OFFSET ?`));
+      this.listWTStmts.set(`cm_${sk}`, p(`${WT_SEL} FROM memories WHERE ${EXPIRES_ALIVE} AND category = ? AND ${META_COND} AND ${DATE_COND} ${order} LIMIT ? OFFSET ?`));
+      this.listWTStmts.set(`tm_${sk}`, p(`${WT_SEL} FROM memories WHERE ${EXPIRES_ALIVE} AND ${TAG_EXISTS} AND ${META_COND} AND ${DATE_COND} ${order} LIMIT ? OFFSET ?`));
+      this.listWTStmts.set(`ctm_${sk}`,p(`${WT_SEL} FROM memories WHERE ${EXPIRES_ALIVE} AND category = ? AND ${TAG_EXISTS} AND ${META_COND} AND ${DATE_COND} ${order} LIMIT ? OFFSET ?`));
+    }
+
+    // Build searchWithTotal: 8 filter combos × 4 sort orders = 32 entries
+    // Sort key "" = default FTS rank; other keys = date-based sorts.
+    // Param order: [ftsQuery, ...category?, ...tag?, ...meta_key+val?, ca, ca, cb, cb, ua, ua, ub, ub, limit, offset]
+    const SEARCH_SORT_ORDERS: Record<string, string> = {
+      "":               "ORDER BY rank",
+      "created_at_desc": "ORDER BY m.created_at DESC, m.rowid DESC",
+      "created_at_asc":  "ORDER BY m.created_at ASC,  m.rowid ASC",
+      "updated_at_desc": "ORDER BY m.updated_at DESC, m.rowid DESC",
+    };
+    const FTS_WT = `SELECT m.*, COUNT(*) OVER () AS total_count FROM memories m JOIN memories_fts fts ON m.rowid = fts.rowid WHERE memories_fts MATCH ? AND ${EXPIRES_ALIVE_M}`;
+    for (const [ss, sorder] of Object.entries(SEARCH_SORT_ORDERS)) {
+      const sk = ss ? `_${ss}` : "";
+      this.searchWTStmts.set(`${sk}`,     p(`${FTS_WT} AND ${DATE_COND_M} ${sorder} LIMIT ? OFFSET ?`));
+      this.searchWTStmts.set(`c${sk}`,    p(`${FTS_WT} AND m.category = ? AND ${DATE_COND_M} ${sorder} LIMIT ? OFFSET ?`));
+      this.searchWTStmts.set(`t${sk}`,    p(`${FTS_WT} AND ${FTS_TAG} AND ${DATE_COND_M} ${sorder} LIMIT ? OFFSET ?`));
+      this.searchWTStmts.set(`ct${sk}`,   p(`${FTS_WT} AND m.category = ? AND ${FTS_TAG} AND ${DATE_COND_M} ${sorder} LIMIT ? OFFSET ?`));
+      this.searchWTStmts.set(`m${sk}`,    p(`${FTS_WT} AND ${META_COND_M} AND ${DATE_COND_M} ${sorder} LIMIT ? OFFSET ?`));
+      this.searchWTStmts.set(`cm${sk}`,   p(`${FTS_WT} AND m.category = ? AND ${META_COND_M} AND ${DATE_COND_M} ${sorder} LIMIT ? OFFSET ?`));
+      this.searchWTStmts.set(`tm${sk}`,   p(`${FTS_WT} AND ${FTS_TAG} AND ${META_COND_M} AND ${DATE_COND_M} ${sorder} LIMIT ? OFFSET ?`));
+      this.searchWTStmts.set(`ctm${sk}`,  p(`${FTS_WT} AND m.category = ? AND ${FTS_TAG} AND ${META_COND_M} AND ${DATE_COND_M} ${sorder} LIMIT ? OFFSET ?`));
+    }
+  }
+
+  private initialize(): void {
+    this.db.pragma("journal_mode = WAL");
+    // NORMAL is safe with WAL and significantly faster than the default FULL
+    this.db.pragma("synchronous = NORMAL");
+    this.db.pragma("foreign_keys = ON");
+    // 64 MB memory-mapped I/O: reduces syscall overhead on repeated reads
+    this.db.pragma("mmap_size = 67108864");
+    // 2000 pages × 4 KB = ~8 MB page cache; default is 2000 but explicit is clearer
+    this.db.pragma("cache_size = -8000"); // negative = kibibytes
+    this.db.exec(SCHEMA_SQL);
+    // Schema migration: version 1 introduces the expires_at column.
+    // For fresh DBs it is already in CREATE TABLE; for old DBs we ALTER TABLE.
+    const dbVersion = this.db.pragma("user_version", { simple: true }) as number;
+    if (dbVersion < 1) {
+      const cols = (this.db.prepare("PRAGMA table_info(memories)").all() as Array<{ name: string }>).map(c => c.name);
+      if (!cols.includes("expires_at")) {
+        this.db.exec("ALTER TABLE memories ADD COLUMN expires_at TEXT;");
+      }
+      // Create the index here (safe for both fresh and migrated DBs)
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_memories_expires_at ON memories(expires_at);");
+      this.db.pragma("user_version = 1");
+    }
+    if (dbVersion < 2) {
+      // v2: memory_links table (already in SCHEMA_SQL for fresh DBs; safe to re-run IF NOT EXISTS)
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_links (
+          from_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+          to_id      TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+          relation   TEXT NOT NULL DEFAULT 'related',
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (from_id, to_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_links_to ON memory_links(to_id);
+      `);
+      this.db.pragma("user_version = 2");
+    }
+    if (dbVersion < 3) {
+      // v3: memory_history table + triggers (already in SCHEMA_SQL for fresh DBs)
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_history (
+          history_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+          memory_id   TEXT NOT NULL,
+          operation   TEXT NOT NULL CHECK(operation IN ('create', 'update', 'delete')),
+          content     TEXT NOT NULL,
+          category    TEXT NOT NULL DEFAULT 'general',
+          tags        TEXT NOT NULL DEFAULT '[]',
+          metadata    TEXT NOT NULL DEFAULT '{}',
+          expires_at  TEXT,
+          changed_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_history_memory_id
+          ON memory_history(memory_id, changed_at DESC);
+        CREATE TRIGGER IF NOT EXISTS memories_history_ai AFTER INSERT ON memories BEGIN
+          INSERT INTO memory_history (memory_id, operation, content, category, tags, metadata, expires_at)
+          VALUES (new.id, 'create', new.content, new.category, new.tags, new.metadata, new.expires_at);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memories_history_au AFTER UPDATE ON memories BEGIN
+          INSERT INTO memory_history (memory_id, operation, content, category, tags, metadata, expires_at)
+          VALUES (new.id, 'update', new.content, new.category, new.tags, new.metadata, new.expires_at);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memories_history_ad AFTER DELETE ON memories BEGIN
+          INSERT INTO memory_history (memory_id, operation, content, category, tags, metadata, expires_at)
+          VALUES (old.id, 'delete', old.content, old.category, old.tags, old.metadata, old.expires_at);
+        END;
+      `);
+      this.db.pragma("user_version = 3");
+    }
+  }
+
+  /** Normalize category: trim + lowercase, default "general" */
+  private normalizeCategory(category: string | undefined): string {
+    return (category ?? "general").trim().toLowerCase() || "general";
+  }
+
+  /** Normalize tags: trim each, discard empty strings, deduplicate */
+  private normalizeTags(tags: string[] | undefined): string[] {
+    if (!tags) return [];
+    return [...new Set(tags.map((t) => t.trim()).filter(Boolean))];
+  }
+
+  /**
+   * Build the FTS5 query string from user input.
+   * - "any"  → `"t1"* OR "t2"*`   (at least one term matches)
+   * - "all"  → `"t1"* "t2"*`      (all terms must appear, implicit AND)
+   * - "near" → `NEAR("t1" "t2", n)` (terms within n tokens of each other)
+   *
+   * Terms are double-quote–escaped to prevent FTS injection.
+   * Prefix `*` is appended for any/all to enable prefix matching.
+   * NEAR does not support prefix matching, so `*` is omitted there.
+   */
+  private buildFtsQuery(query: string, mode: "any" | "all" | "near" = "any", nearDistance = 10): string | null {
+    const terms = query.split(/\s+/).filter(Boolean);
+    if (terms.length === 0) return null;
+
+    // Escape inner double-quotes to prevent FTS injection
+    const sanitized = terms.map((t) => t.replace(/"/g, '""'));
+
+    if (mode === "near") {
+      // NEAR("term1" "term2", distance) — no prefix * inside NEAR()
+      const inner = sanitized.map((t) => `"${t}"`).join(" ");
+      return `NEAR(${inner}, ${nearDistance})`;
+    }
+
+    const quoted = sanitized.map((t) => `"${t}"*`);
+    return quoted.join(mode === "all" ? " " : " OR ");
+  }
+
+  private rowToMemory(row: MemoryRow): Memory {
+    return {
+      ...row,
+      tags: JSON.parse(row.tags) as string[],
+      metadata: JSON.parse(row.metadata) as Record<string, unknown>,
+    };
+  }
+
+  create(input: CreateMemoryInput): Memory {
+    const id = randomUUID();
+    const content = input.content.trim();
+    const category = this.normalizeCategory(input.category);
+    const tags = JSON.stringify(this.normalizeTags(input.tags));
+    const metadata = JSON.stringify(input.metadata ?? {});
+    const expires_at = input.expires_at ?? null;
+
+    // RETURNING * eliminates the extra getById round-trip
+    const row = this.stmtCreate.get(
+      id, content, category, tags, metadata, expires_at
+    ) as MemoryRow;
+
+    return this.rowToMemory(row);
+  }
+
+  /**
+   * Bulk-insert multiple memories in a single SQLite transaction.
+   * Significantly faster than calling create() in a loop for large batches.
+   * Skips empty inputs arrays without touching the database.
+   */
+  createBatch(inputs: CreateMemoryInput[]): Memory[] {
+    if (inputs.length === 0) return [];
+    const insertAll = this.db.transaction((items: CreateMemoryInput[]) =>
+      items.map((input) => this.create(input))
+    );
+    return insertAll(inputs);
+  }
+
+  getById(id: string): Memory | null {
+    const row = this.stmtGetById.get(id) as MemoryRow | undefined;
+    return row ? this.rowToMemory(row) : null;
+  }
+
+  /**
+   * Fetch multiple memories by id in a single query.
+   * Uses `json_each(?)` to pass all ids as a JSON array — avoids N round-trips.
+   * Preserves recency order (created_at DESC, rowid DESC).
+   * ids not found are simply absent from the result (no error).
+   */
+  getByIds(ids: string[]): Memory[] {
+    if (ids.length === 0) return [];
+    const rows = this.stmtGetByIds.all(JSON.stringify(ids)) as MemoryRow[];
+    return rows.map((row) => this.rowToMemory(row));
+  }
+
+  update(id: string, input: UpdateMemoryInput): Memory | null {
+    const existing = this.getById(id);
+    if (!existing) return null;
+
+    const content = (input.content ?? existing.content).trim();
+    const category = input.category !== undefined
+      ? this.normalizeCategory(input.category)
+      : existing.category;
+    const tags = JSON.stringify(
+      input.tags !== undefined ? this.normalizeTags(input.tags) : existing.tags
+    );
+    const metadata = JSON.stringify(input.metadata ?? existing.metadata);
+    // expires_at: undefined = keep existing, null = clear, string = set new
+    const expires_at = input.expires_at !== undefined
+      ? (input.expires_at ?? null)
+      : (existing.expires_at ?? null);
+
+    // RETURNING * eliminates the extra getById round-trip after the update
+    const row = this.stmtUpdate.get(
+      content, category, tags, metadata, expires_at, id
+    ) as MemoryRow;
+
+    return this.rowToMemory(row);
+  }
+
+  /**
+   * Bulk-update memories in a single SQLite transaction.
+   * Returns successfully updated memories and ids that were not found.
+   * Reuses update() internally — full normalization + merge of missing fields.
+   */
+  updateBatch(updates: BatchUpdateItem[]): { updated: Memory[]; notFound: string[] } {
+    if (updates.length === 0) return { updated: [], notFound: [] };
+    const updateAll = this.db.transaction((items: Array<{ id: string } & UpdateMemoryInput>) => {
+      const updated: Memory[] = [];
+      const notFound: string[] = [];
+      for (const { id, ...input } of items) {
+        const result = this.update(id, input);
+        if (result) {
+          updated.push(result);
+        } else {
+          notFound.push(id);
+        }
+      }
+      return { updated, notFound };
+    });
+    return updateAll(updates);
+  }
+
+  delete(id: string): boolean {
+    const result = this.stmtDelete.run(id);
+    return result.changes > 0;
+  }
+
+  /**
+   * Bulk-delete memories by id in a single SQLite transaction.
+   * Returns how many were actually deleted and which ids were not found.
+   */
+  deleteBatch(ids: string[]): { deleted: number; notFound: string[] } {
+    if (ids.length === 0) return { deleted: 0, notFound: [] };
+    const deleteAll = this.db.transaction((idList: string[]) => {
+      const notFound: string[] = [];
+      let deleted = 0;
+      for (const id of idList) {
+        const result = this.stmtDelete.run(id);
+        if (result.changes > 0) {
+          deleted++;
+        } else {
+          notFound.push(id);
+        }
+      }
+      return { deleted, notFound };
+    });
+    return deleteAll(ids);
+  }
+
+  /** @deprecated Use searchWithTotal() instead — delegates to it internally. */
+  search(input: SearchMemoriesInput): Memory[] {
+    return this.searchWithTotal(input).memories;
+  }
+
+  searchWithTotal(input: SearchMemoriesInput): { memories: Memory[]; total: number } {
+    const { query, tag, limit = 10, mode = "any", near_distance = 10 } = input;
+    const category = input.category ? input.category.trim().toLowerCase() : undefined;
+
+    const ftsQuery = this.buildFtsQuery(query, mode, near_distance);
+    if (!ftsQuery) return { memories: [], total: 0 };
+
+    const offset = input.offset ?? 0;
+    const mk = input.metadata_key;
+    const mv = input.metadata_value;
+    const hasMeta = mk !== undefined && mv !== undefined;
+    const ca = input.created_after ?? null;
+    const cb = input.created_before ?? null;
+    const ua = input.updated_after ?? null;
+    const ub = input.updated_before ?? null;
+    const sortKey = input.sort_by ?? "";
+
+    const fk = `${category ? "c" : ""}${tag ? "t" : ""}${hasMeta ? "m" : ""}${sortKey ? `_${sortKey}` : ""}`;
+    const stmt = this.searchWTStmts.get(fk)!;
+
+    const params: unknown[] = [ftsQuery];
+    if (category) params.push(category);
+    if (tag) params.push(tag);
+    if (hasMeta) params.push(mk, mv);
+    params.push(ca, ca, cb, cb, ua, ua, ub, ub, limit, offset);
+
+    type RowWithTotal = MemoryRow & { total_count: number };
+    const rows = stmt.all(...params) as RowWithTotal[];
+    const total = rows.length > 0 ? rows[0].total_count : 0;
+    const memories = rows.map(({ total_count: _tc, ...memRow }) => this.rowToMemory(memRow as MemoryRow));
+    return { memories, total };
+  }
+
+  /** @deprecated Use listWithTotal() instead — delegates to it internally. */
+  count(input: ListMemoriesInput = {}): number {
+    return this.listWithTotal({ ...input, limit: 1, offset: 0 }).total;
+  }
+
+  /** @deprecated Use listWithTotal() instead — delegates to it internally. */
+  list(input: ListMemoriesInput = {}): Memory[] {
+    return this.listWithTotal(input).memories;
+  }
+
+  /**
+   * Returns a compact session-context snapshot using at most **2 SQL queries** regardless
+   * of how many categories exist.
+   *
+   * Query 1 — window-function scan: retrieves every row annotated with
+   *   `cat_count` (total per category) and `rn` (recency rank within category).
+   *   Rows where `rn <= recentPerCategory` are selected as recent items;
+   *   `cat_count` provides the total for each category — all in one pass.
+   *
+   * Query 2 — tag frequency (only if `includeTagsIndex = true`, default):
+   *   json_each flattens tag arrays into individual rows counted in JS.
+   *
+   * @param recentPerCategory How many recent memories to surface per category (default 3)
+   * @param contentPreviewLen If set, truncates content in recent items to this many characters
+   * @param includeTagsIndex Whether to compute the tags frequency index (default true)
+   */
+  getContextSnapshot(
+    recentPerCategory = 3,
+    contentPreviewLen?: number,
+    includeTagsIndex = true,
+  ): ContextSnapshot {
+    type SnapshotRow = {
+      id: string;
+      content: string;
+      category: string;
+      tags: string;
+      cat_count: number;
+      rn: number;
+    };
+
+    // Single pass over the table: window functions compute count + rank atomically
+    const rows = this.stmtSnapshot.all() as SnapshotRow[];
+
+    const by_category: ContextSnapshot["by_category"] = {};
+    let total = 0;
+    const seenCategories = new Set<string>();
+
+    for (const row of rows) {
+      if (!seenCategories.has(row.category)) {
+        by_category[row.category] = { count: row.cat_count, recent: [] };
+        total += row.cat_count;
+        seenCategories.add(row.category);
+      }
+      if (row.rn <= recentPerCategory) {
+        const content = contentPreviewLen != null
+          ? row.content.slice(0, contentPreviewLen)
+          : row.content;
+        by_category[row.category].recent.push({
+          id: row.id,
+          content,
+          category: row.category,
+          tags: JSON.parse(row.tags) as string[],
+        } satisfies MemorySlim);
+      }
+    }
+
+    // Tag frequency index: flatten all tag arrays via json_each (skipped if not needed)
+    const tags_index: Record<string, number> = {};
+    if (includeTagsIndex) {
+      const tagRows = this.stmtTagFreq.all() as { tag: string }[];
+      for (const { tag } of tagRows) {
+        tags_index[tag] = (tags_index[tag] ?? 0) + 1;
+      }
+    }
+
+    return { total, by_category, tags_index };
+  }
+
+  /**
+   * List memories and return the total filtered count in a single query.
+   * Uses `COUNT(*) OVER ()` window function — eliminates the separate `count()` call.
+   * Supports sort_by, date range filters (created_after, updated_after), and metadata filtering.
+   */
+  listWithTotal(input: ListMemoriesInput = {}): { memories: Memory[]; total: number } {
+    const { tag, limit = 10, offset = 0 } = input;
+    const category = input.category ? input.category.trim().toLowerCase() : undefined;
+    const mk = input.metadata_key;
+    const mv = input.metadata_value;
+    const hasMeta = mk !== undefined && mv !== undefined;
+    const sortBy: SortBy = input.sort_by ?? "created_at_desc";
+    const ca = input.created_after ?? null;
+    const cb = input.created_before ?? null;
+    const ua = input.updated_after ?? null;
+    const ub = input.updated_before ?? null;
+
+    const fk = `${category ? "c" : ""}${tag ? "t" : ""}${hasMeta ? "m" : ""}_${sortBy}`;
+    const stmt = this.listWTStmts.get(fk)!;
+
+    const params: unknown[] = [];
+    if (category) params.push(category);
+    if (tag) params.push(tag);
+    if (hasMeta) params.push(mk, mv);
+    params.push(ca, ca, cb, cb, ua, ua, ub, ub, limit, offset);
+
+    type RowWithTotal = MemoryRow & { total_count: number };
+    const rows = stmt.all(...params) as RowWithTotal[];
+    const total = rows.length > 0 ? rows[0].total_count : 0;
+    const memories = rows.map(({ total_count: _tc, ...memRow }) => this.rowToMemory(memRow as MemoryRow));
+    return { memories, total };
+  }
+
+  /**
+   * Run database maintenance: integrity check + WAL checkpoint.
+   * Returns a structured report with integrity status and checkpoint stats.
+   */
+  maintenance(checkpointMode: "PASSIVE" | "FULL" | "RESTART" | "TRUNCATE" = "PASSIVE"): {
+    integrity_ok: boolean;
+    integrity_errors: string[];
+    wal_checkpoint: { busy: number; log: number; checkpointed: number };
+  } {
+    // integrity_check returns [{integrity_check: "ok"}] on success, or error rows
+    const integrityRows = this.db.pragma("integrity_check") as Array<{ integrity_check: string }>;
+    const integrity_ok = integrityRows.length === 1 && integrityRows[0].integrity_check === "ok";
+    const integrity_errors = integrity_ok ? [] : integrityRows.map((r) => r.integrity_check);
+
+    // wal_checkpoint returns [{busy, log, checkpointed}]
+    const walRows = this.db.pragma(`wal_checkpoint(${checkpointMode})`) as Array<{
+      busy: number;
+      log: number;
+      checkpointed: number;
+    }>;
+    const wal_checkpoint = walRows[0] ?? { busy: 0, log: 0, checkpointed: 0 };
+
+    return { integrity_ok, integrity_errors, wal_checkpoint };
+  }
+
+  /**
+   * Physically remove all memories whose expires_at is in the past.
+   * Returns the count and list of purged ids.
+   */
+  purgeExpired(): { purged: number; ids: string[] } {
+    const rows = this.stmtPurgeExpired.all() as Array<{ id: string }>;
+    return { purged: rows.length, ids: rows.map(r => r.id) };
+  }
+
+  /**
+   * Export all memories matching optional filters as a raw array.
+   * Reuses listWithTotal with a high ceiling — no extra SQL needed.
+   * Default limit 10_000 to avoid unbounded memory; callers can lower it.
+   */
+  exportAll(input: ExportMemoriesInput = {}): Memory[] {
+    const { category, tag } = input;
+    const limit = input.limit ?? 10_000;
+    return this.listWithTotal({ category, tag, limit, offset: 0, sort_by: "created_at_asc" }).memories;
+  }
+
+  /**
+   * Bulk-import memories in a single transaction.
+   * - mode='insert': always creates new memories (ignores provided id, generates fresh UUID).
+   * - mode='upsert': if id is provided AND already exists, updates it; otherwise inserts.
+   * Returns count of imported/updated rows, skipped (invalid content), and resulting ids.
+   */
+  importBatch(rows: ImportMemoryRow[], mode: ImportMode = "insert"): ImportResult {
+    if (rows.length === 0) return { imported: 0, skipped: 0, ids: [] };
+
+    const run = this.db.transaction((items: ImportMemoryRow[]) => {
+      const ids: string[] = [];
+      let skipped = 0;
+
+      for (const row of items) {
+        // Skip rows with empty or missing content
+        if (!row.content || !row.content.trim()) { skipped++; continue; }
+
+        if (mode === "upsert" && row.id) {
+          const existing = this.getById(row.id);
+          if (existing) {
+            // Update existing record — merge provided fields over existing
+            const updated = this.update(row.id, {
+              content: row.content,
+              category: row.category,
+              tags: row.tags,
+              metadata: row.metadata,
+            });
+            if (updated) { ids.push(updated.id); continue; }
+          }
+        }
+        // Insert as new memory (fresh UUID regardless of provided id in insert mode)
+        const created = this.create({
+          content: row.content,
+          category: row.category,
+          tags: row.tags,
+          metadata: row.metadata,
+        });
+        ids.push(created.id);
+      }
+
+      return { imported: ids.length, skipped, ids };
+    });
+
+    return run(rows);
+  }
+
+  /**
+   * Compute aggregate statistics about the memories database.
+   * Uses 3 SQL queries: category counts, tag frequency, and scalar aggregates.
+   */
+  getStats(): StatsResult {
+    // --- Category counts ---
+    const catRows = this.db.prepare(
+      "SELECT category, COUNT(*) AS cnt FROM memories GROUP BY category ORDER BY cnt DESC"
+    ).all() as Array<{ category: string; cnt: number }>;
+
+    const by_category: Record<string, number> = {};
+    let total = 0;
+    for (const { category, cnt } of catRows) {
+      by_category[category] = cnt;
+      total += cnt;
+    }
+
+    // --- Tag frequency (top 20) ---
+    const tagRows = this.db.prepare(
+      `SELECT json_each.value AS tag, COUNT(*) AS cnt
+       FROM memories, json_each(memories.tags)
+       GROUP BY tag ORDER BY cnt DESC LIMIT 20`
+    ).all() as Array<{ tag: string; cnt: number }>;
+    const top_tags = tagRows.map(({ tag, cnt }) => ({ tag, count: cnt }));
+
+    // --- Scalar aggregates ---
+    const agg = this.db.prepare(
+      `SELECT
+         AVG(LENGTH(content))       AS avg_len,
+         SUM(CASE WHEN tags = '[]'     THEN 1 ELSE 0 END) AS no_tags,
+         SUM(CASE WHEN metadata = '{}' THEN 1 ELSE 0 END) AS no_meta
+       FROM memories`
+    ).get() as { avg_len: number | null; no_tags: number; no_meta: number } | undefined;
+
+    const avg_content_len = agg?.avg_len != null ? Math.round(agg.avg_len) : 0;
+    const memories_without_tags     = agg?.no_tags ?? 0;
+    const memories_without_metadata = agg?.no_meta ?? 0;
+
+    // --- Oldest / newest ---
+    const oldestRow = this.db.prepare("SELECT * FROM memories ORDER BY created_at ASC,  rowid ASC  LIMIT 1").get() as MemoryRow | undefined;
+    const newestRow = this.db.prepare("SELECT * FROM memories ORDER BY created_at DESC, rowid DESC LIMIT 1").get() as MemoryRow | undefined;
+
+    return {
+      total,
+      by_category,
+      top_tags,
+      oldest: oldestRow ? this.rowToMemory(oldestRow) : null,
+      newest: newestRow ? this.rowToMemory(newestRow) : null,
+      avg_content_len,
+      memories_without_tags,
+      memories_without_metadata,
+    };
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Relations API (Ronda 25)
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Create or update a directional link between two memories.
+   * Upsert semantics: if the pair (from_id, to_id) already exists the relation
+   * is replaced with the new value.
+   */
+  linkMemories(input: LinkMemoriesInput): MemoryLink {
+    const { from_id, to_id, relation = "related" } = input;
+    const row = this.stmtLinkUpsert.get(from_id, to_id, relation) as MemoryLink;
+    return row;
+  }
+
+  /**
+   * Retrieve a single link by its (from_id, to_id) pair.
+   * Returns null if no such link exists.
+   */
+  getLink(from_id: string, to_id: string): MemoryLink | null {
+    const row = this.stmtGetLink.get(from_id, to_id) as MemoryLink | undefined;
+    return row ?? null;
+  }
+
+  /**
+   * Update the relation type of an existing link.
+   * Returns the updated MemoryLink, or null if the link does not exist.
+   */
+  updateLink(from_id: string, to_id: string, relation: RelationType): MemoryLink | null {
+    const row = this.stmtUpdateLink.get(relation, from_id, to_id) as MemoryLink | undefined;
+    return row ?? null;
+  }
+
+  /**
+   * Remove a link between two memories.
+   * Returns true if a link was found and removed, false if it did not exist.
+   */
+  unlinkMemories(from_id: string, to_id: string): boolean {
+    const row = this.stmtUnlink.get(from_id, to_id);
+    return row !== undefined;
+  }
+
+  /**
+   * Retrieve memories linked to/from the given id.
+   * direction="from"  → memories that `id` points to (outgoing)
+   * direction="to"    → memories that point to `id`  (incoming)
+   * direction="both"  → all linked memories
+   * Optionally filtered by relation type.
+   */
+  getRelated(input: GetRelatedInput): RelatedMemory[] {
+    const { id, relation, direction = "both" } = input;
+    const results: RelatedMemory[] = [];
+
+    if (direction === "from" || direction === "both") {
+      const stmt = relation ? this.stmtLinksFromRel : this.stmtLinksFrom;
+      const params: unknown[] = relation ? [id, relation] : [id];
+      const rows = stmt.all(...params) as LinkQueryRow[];
+      for (const row of rows) {
+        results.push({
+          memory: this.rowToMemory(row),
+          relation: row.relation as RelationType,
+          direction: "from",
+          linked_at: row.link_created_at,
+        });
+      }
+    }
+
+    if (direction === "to" || direction === "both") {
+      const stmt = relation ? this.stmtLinksToRel : this.stmtLinksTo;
+      const params: unknown[] = relation ? [id, relation] : [id];
+      const rows = stmt.all(...params) as LinkQueryRow[];
+      for (const row of rows) {
+        results.push({
+          memory: this.rowToMemory(row),
+          relation: row.relation as RelationType,
+          direction: "to",
+          linked_at: row.link_created_at,
+        });
+      }
+    }
+
+    return results;
+  }
+
+  close(): void {
+    // Optimize the FTS5 index and SQLite internals before closing
+    this.db.pragma("optimize");
+    this.db.close();
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Tag utilities (Ronda 26)
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Rename a tag across all memories that carry it.
+   * Uses json_group_array(DISTINCT ...) to eliminate duplicates when a memory
+   * already has the new tag. FTS is updated automatically via the memories_au trigger.
+   * Returns the number of updated memories and the old/new tag names.
+   */
+  renameTag(oldTag: string, newTag: string): RenameTagResult {
+    const rows = this.db.prepare(
+      `UPDATE memories
+       SET tags = (
+         SELECT json_group_array(DISTINCT CASE WHEN value = ? THEN ? ELSE value END)
+         FROM json_each(memories.tags)
+       ),
+       updated_at = datetime('now')
+       WHERE EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE value = ?)
+       RETURNING id`
+    ).all(oldTag, newTag, oldTag) as Array<{ id: string }>;
+
+    return { updated: rows.length, old_tag: oldTag, new_tag: newTag };
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Links listing (Ronda 26)
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * List edges in the memory_links graph with optional filters.
+   * Supports filtering by from_id, to_id and/or relation type, plus pagination.
+   */
+  listLinks(input: ListLinksInput): ListLinksResult {
+    const { from_id, to_id, relation, limit = 50, offset = 0 } = input;
+
+    const conditions: string[] = [];
+    const params: unknown[] = [];
+
+    if (from_id)  { conditions.push("from_id = ?");  params.push(from_id); }
+    if (to_id)    { conditions.push("to_id = ?");    params.push(to_id); }
+    if (relation) { conditions.push("relation = ?"); params.push(relation); }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+    const countRow = this.db.prepare(
+      `SELECT COUNT(*) AS cnt FROM memory_links ${where}`
+    ).get(...params) as { cnt: number };
+
+    const linkParams = [...params, limit, offset];
+    const rows = this.db.prepare(
+      `SELECT * FROM memory_links ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+    ).all(...linkParams) as MemoryLink[];
+
+    return { total: countRow.cnt, offset, limit, links: rows };
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // History API (Ronda 28)
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /** Convert a raw history DB row → typed MemoryHistoryEntry */
+  private rowToHistoryEntry(row: HistoryRow): MemoryHistoryEntry {
+    return {
+      history_id: row.history_id,
+      memory_id: row.memory_id,
+      operation: row.operation as MemoryHistoryEntry["operation"],
+      content: row.content,
+      category: row.category,
+      tags: JSON.parse(row.tags) as string[],
+      metadata: JSON.parse(row.metadata) as Record<string, unknown>,
+      expires_at: row.expires_at,
+      changed_at: row.changed_at,
+    };
+  }
+
+  /**
+   * Retrieve the change history for a specific memory, newest first.
+   */
+  getHistory(input: GetHistoryInput): GetHistoryResult {
+    const { memory_id, limit = 50, offset = 0 } = input;
+    const countRow = this.stmtHistoryCount.get(memory_id) as { cnt: number };
+    const rows = this.stmtHistoryRows.all(memory_id, limit, offset) as HistoryRow[];
+    return {
+      total: countRow.cnt,
+      offset,
+      limit,
+      entries: rows.map((r) => this.rowToHistoryEntry(r)),
+    };
+  }
+
+  /**
+   * Restore a memory to a previous state stored in memory_history.
+   * Returns the restored Memory, or null if the history entry or memory does not exist.
+   * The restore itself is tracked as a new 'update' history entry.
+   */
+  restoreMemory(input: RestoreMemoryInput): Memory | null {
+    const { memory_id, history_id } = input;
+
+    // Verify the memory still exists
+    const current = this.stmtGetById.get(memory_id) as MemoryRow | undefined;
+    if (!current) return null;
+
+    // Find the history entry
+    const histRow = this.stmtHistoryEntry.get(history_id, memory_id) as HistoryRow | undefined;
+    if (!histRow) return null;
+
+    // Apply the stored snapshot — the au trigger will log an 'update' entry automatically
+    const updated = this.stmtUpdate.get(
+      histRow.content,
+      histRow.category,
+      histRow.tags,
+      histRow.metadata,
+      histRow.expires_at,
+      memory_id
+    ) as MemoryRow;
+
+    return this.rowToMemory(updated);
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Graph API (Ronda 28)
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Build the memory graph.
+   * include_orphans=true → also include memories with no links.
+   * relation → restrict edges (and thus nodes) to a specific relation type.
+   */
+  getGraph(input: GetGraphInput = {}): GraphResult {
+    const { include_orphans = false, relation } = input;
+
+    // Fetch edges (optionally filtered by relation type)
+    const edgeRows = relation
+      ? (this.db.prepare("SELECT from_id, to_id, relation FROM memory_links WHERE relation = ? ORDER BY created_at DESC").all(relation) as GraphEdge[])
+      : (this.db.prepare("SELECT from_id, to_id, relation FROM memory_links ORDER BY created_at DESC").all() as GraphEdge[]);
+
+    const edges: GraphEdge[] = edgeRows;
+
+    // Collect the set of IDs that appear in edges
+    const linkedIds = new Set<string>();
+    for (const e of edges) {
+      linkedIds.add(e.from_id);
+      linkedIds.add(e.to_id);
+    }
+
+    // Fetch node details
+    let nodeRows: MemoryRow[];
+    const ALIVE = "(expires_at IS NULL OR expires_at > datetime('now'))";
+    if (include_orphans) {
+      nodeRows = this.db.prepare(
+        `SELECT * FROM memories WHERE ${ALIVE} ORDER BY created_at DESC`
+      ).all() as MemoryRow[];
+    } else if (linkedIds.size > 0) {
+      const placeholders = Array.from(linkedIds).map(() => "?").join(", ");
+      nodeRows = this.db.prepare(
+        `SELECT * FROM memories WHERE id IN (${placeholders}) AND ${ALIVE}`
+      ).all(...Array.from(linkedIds)) as MemoryRow[];
+    } else {
+      nodeRows = [];
+    }
+
+    const nodes: GraphNode[] = nodeRows.map((row) => ({
+      id: row.id,
+      content_preview: row.content.slice(0, 60).replace(/\n/g, " "),
+      category: row.category,
+      tags: JSON.parse(row.tags) as string[],
+    }));
+
+    const mermaid = this.buildMermaid(nodes, edges);
+
+    return {
+      node_count: nodes.length,
+      edge_count: edges.length,
+      nodes,
+      edges,
+      mermaid,
+    };
+  }
+
+  /**
+   * Generate a Mermaid flowchart string from nodes and edges.
+   */
+  private buildMermaid(nodes: GraphNode[], edges: GraphEdge[]): string {
+    if (nodes.length === 0 && edges.length === 0) {
+      return "flowchart LR\n  empty[\"No memories in graph\"]";
+    }
+
+    const lines: string[] = ["flowchart LR"];
+
+    // Mermaid node ID: 'n' + first 8 hex chars of UUID (no dashes)
+    const mId = (id: string) => "n" + id.replace(/-/g, "").slice(0, 8);
+
+    // Declare all nodes with labels
+    for (const node of nodes) {
+      const label = node.content_preview
+        .slice(0, 40)
+        .replace(/"/g, "'")
+        .replace(/[<>]/g, " ");
+      lines.push(`  ${mId(node.id)}["${label} (${node.category})"]`);
+    }
+
+    // Declare edges
+    for (const edge of edges) {
+      lines.push(`  ${mId(edge.from_id)} -- ${edge.relation} --> ${mId(edge.to_id)}`);
+    }
+
+    return lines.join("\n");
+  }}

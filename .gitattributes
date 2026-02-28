@@ -1,0 +1,7 @@
+# Normalize line endings to LF in the repository
+* text=auto eol=lf
+
+# Binary files
+*.db binary
+*.db-shm binary
+*.db-wal binary
