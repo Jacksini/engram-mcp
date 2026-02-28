@@ -1,4 +1,9 @@
+<div align="center">
+  <img src="Engram.png" alt="Engram logo" width="180" />
+
 # Engram
+
+</div>
 
 A persistent memory server for AI agents, implemented as an [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server. Stores structured notes/memories in a local SQLite database with full-text search, tagging, categorisation, TTL expiration, directional graph relationships, and full change history.
 
