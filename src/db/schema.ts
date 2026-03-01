@@ -5,6 +5,7 @@ export const SCHEMA_SQL = `
     category    TEXT NOT NULL DEFAULT 'general',
     tags        TEXT NOT NULL DEFAULT '[]',
     metadata    TEXT NOT NULL DEFAULT '{}',
+    project     TEXT NOT NULL DEFAULT 'default',
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
     expires_at  TEXT
@@ -37,6 +38,8 @@ export const SCHEMA_SQL = `
 
   CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
   CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
+  CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project);
+  CREATE INDEX IF NOT EXISTS idx_memories_project_category ON memories(project, category);
   -- idx_memories_expires_at is created in the v1 migration (after ALTER TABLE on old DBs)
 
   CREATE TABLE IF NOT EXISTS memory_links (
@@ -58,6 +61,7 @@ export const SCHEMA_SQL = `
     category    TEXT NOT NULL DEFAULT 'general',
     tags        TEXT NOT NULL DEFAULT '[]',
     metadata    TEXT NOT NULL DEFAULT '{}',
+    project     TEXT NOT NULL DEFAULT 'default',
     expires_at  TEXT,
     changed_at  TEXT NOT NULL DEFAULT (datetime('now'))
   );
@@ -66,17 +70,17 @@ export const SCHEMA_SQL = `
     ON memory_history(memory_id, changed_at DESC);
 
   CREATE TRIGGER IF NOT EXISTS memories_history_ai AFTER INSERT ON memories BEGIN
-    INSERT INTO memory_history (memory_id, operation, content, category, tags, metadata, expires_at)
-    VALUES (new.id, 'create', new.content, new.category, new.tags, new.metadata, new.expires_at);
+    INSERT INTO memory_history (memory_id, operation, content, category, tags, metadata, project, expires_at)
+    VALUES (new.id, 'create', new.content, new.category, new.tags, new.metadata, new.project, new.expires_at);
   END;
 
   CREATE TRIGGER IF NOT EXISTS memories_history_au AFTER UPDATE ON memories BEGIN
-    INSERT INTO memory_history (memory_id, operation, content, category, tags, metadata, expires_at)
-    VALUES (new.id, 'update', new.content, new.category, new.tags, new.metadata, new.expires_at);
+    INSERT INTO memory_history (memory_id, operation, content, category, tags, metadata, project, expires_at)
+    VALUES (new.id, 'update', new.content, new.category, new.tags, new.metadata, new.project, new.expires_at);
   END;
 
   CREATE TRIGGER IF NOT EXISTS memories_history_ad AFTER DELETE ON memories BEGIN
-    INSERT INTO memory_history (memory_id, operation, content, category, tags, metadata, expires_at)
-    VALUES (old.id, 'delete', old.content, old.category, old.tags, old.metadata, old.expires_at);
+    INSERT INTO memory_history (memory_id, operation, content, category, tags, metadata, project, expires_at)
+    VALUES (old.id, 'delete', old.content, old.category, old.tags, old.metadata, old.project, old.expires_at);
   END;
 `;

@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { MemoryDatabase } from "../db/database.js";
-import { CategoryEnum, CompactParams, SortByParam } from "./schemas.js";
+import { CategoryEnum, CompactParams, SortByParam, ProjectParam } from "./schemas.js";
 
 export function registerSearchMemories(server: McpServer, db: MemoryDatabase): void {
   server.tool(
@@ -56,6 +56,7 @@ export function registerSearchMemories(server: McpServer, db: MemoryDatabase): v
         .optional()
         .describe("ISO datetime. Solo memorias actualizadas en o antes de esta fecha."),
       sort_by: SortByParam,
+      project: ProjectParam,
       metadata_key: z
         .string()
         .optional()
@@ -66,11 +67,11 @@ export function registerSearchMemories(server: McpServer, db: MemoryDatabase): v
         .describe("Valor exacto a buscar en el campo metadata_key via json_extract."),
       ...CompactParams,
     },
-    async ({ query, category, tag, limit, mode, near_distance, offset, created_after, created_before, updated_after, updated_before, sort_by, metadata_key, metadata_value, compact, content_preview_len }) => {
+    async ({ query, category, tag, limit, mode, near_distance, offset, created_after, created_before, updated_after, updated_before, sort_by, project, metadata_key, metadata_value, compact, content_preview_len }) => {
       const resolvedLimit = limit ?? 10;
       const resolvedOffset = offset ?? 0;
       const { memories, total } = db.searchWithTotal({
-        query, category, tag,
+        query, category, tag, project,
         limit: resolvedLimit, mode, near_distance,
         offset: resolvedOffset,
         created_after, created_before, updated_after, updated_before, sort_by,

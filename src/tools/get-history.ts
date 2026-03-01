@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { MemoryDatabase } from "../db/database.js";
+import { ProjectParam } from "./schemas.js";
 
 export function registerGetHistory(server: McpServer, db: MemoryDatabase): void {
   server.tool(
@@ -27,9 +28,10 @@ export function registerGetHistory(server: McpServer, db: MemoryDatabase): void 
         .min(0)
         .optional()
         .describe("Offset para paginación (>= 0). Por defecto 0."),
+      project: ProjectParam,
     },
-    async ({ memory_id, limit, offset }) => {
-      const result = db.getHistory({ memory_id, limit, offset });
+    async ({ memory_id, limit, offset, project }) => {
+      const result = db.getHistory({ memory_id, limit, offset, project });
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
       };

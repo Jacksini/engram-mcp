@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { MemoryDatabase } from "../db/database.js";
-import { CategoryEnum } from "./schemas.js";
+import { CategoryEnum, ProjectParam } from "./schemas.js";
 
 export function registerExportMemories(server: McpServer, db: MemoryDatabase): void {
   server.tool(
@@ -17,9 +17,10 @@ export function registerExportMemories(server: McpServer, db: MemoryDatabase): v
         .max(10_000)
         .optional()
         .describe("Máximo de memorias a exportar (default 10.000)"),
+      project: ProjectParam,
     },
-    async ({ category, tag, limit }) => {
-      const memories = db.exportAll({ category, tag, limit });
+    async ({ category, tag, limit, project }) => {
+      const memories = db.exportAll({ category, tag, limit, project });
       return {
         content: [
           {

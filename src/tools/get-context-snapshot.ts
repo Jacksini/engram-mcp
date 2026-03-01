@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { MemoryDatabase } from "../db/database.js";
+import { ProjectParam } from "./schemas.js";
 
 export function registerGetContextSnapshot(server: McpServer, db: MemoryDatabase): void {
   server.tool(
@@ -25,12 +26,14 @@ export function registerGetContextSnapshot(server: McpServer, db: MemoryDatabase
         .boolean()
         .optional()
         .describe("Si false, omite el índice de frecuencia de tags (ahorra la segunda query SQL). Por defecto true."),
+      project: ProjectParam,
     },
-    async ({ recent_per_category, content_preview_len, include_tags_index }) => {
+    async ({ recent_per_category, content_preview_len, include_tags_index, project }) => {
       const snapshot = db.getContextSnapshot(
         recent_per_category ?? 3,
         content_preview_len,
         include_tags_index ?? true,
+        project,
       );
       return {
         content: [

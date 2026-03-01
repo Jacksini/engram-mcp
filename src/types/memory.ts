@@ -4,6 +4,7 @@ export interface Memory {
   category: string;
   tags: string[];
   metadata: Record<string, unknown>;
+  project: string;
   created_at: string;
   updated_at: string;
   /** ISO datetime string. Null means no expiration. */
@@ -15,6 +16,8 @@ export interface CreateMemoryInput {
   category?: string;
   tags?: string[];
   metadata?: Record<string, unknown>;
+  /** Project namespace. When omitted, uses the server's default project. */
+  project?: string;
   /** Optional expiration. ISO datetime string. Null or omit for no expiration. */
   expires_at?: string | null;
 }
@@ -34,6 +37,8 @@ export interface SearchMemoriesInput {
   query: string;
   category?: string;
   tag?: string;
+  /** Project namespace to scope the search. When omitted, uses the server's default project. */
+  project?: string;
   limit?: number;
   offset?: number;
   /** "any" = OR between terms (default), "all" = AND, "near" = FTS5 NEAR(terms, distance) */
@@ -65,6 +70,8 @@ export type SortBy = "created_at_desc" | "created_at_asc" | "updated_at_desc";
 export interface ListMemoriesInput {
   category?: string;
   tag?: string;
+  /** Project namespace to scope the listing. When omitted, uses the server's default project. */
+  project?: string;
   limit?: number;
   offset?: number;
   /** Filter by a specific key in the metadata JSON object. Must be combined with metadata_value. */
@@ -97,6 +104,7 @@ export interface MemorySlim {
   content: string;
   category: string;
   tags: string[];
+  project: string;
 }
 
 export interface CategorySnapshot {
@@ -118,6 +126,8 @@ export interface ContextSnapshot {
 export interface ExportMemoriesInput {
   category?: string;
   tag?: string;
+  /** Project namespace to scope the export. When omitted, uses the server's default project. */
+  project?: string;
   limit?: number;
 }
 
@@ -130,6 +140,8 @@ export interface ImportMemoryRow {
   category?: string;
   tags?: string[];
   metadata?: Record<string, unknown>;
+  /** Project namespace. When omitted, uses the server's default project. */
+  project?: string;
 }
 
 export interface ImportResult {
@@ -236,6 +248,8 @@ export interface GraphEdge {
 export interface GetGraphInput {
   include_orphans?: boolean;
   relation?: RelationType;
+  /** Project namespace to scope the graph. When omitted, uses the server's default project. */
+  project?: string;
 }
 
 export interface GraphResult {
@@ -260,12 +274,15 @@ export interface MemoryHistoryEntry {
   category: string;
   tags: string[];
   metadata: Record<string, unknown>;
+  project: string;
   expires_at: string | null;
   changed_at: string;
 }
 
 export interface GetHistoryInput {
   memory_id: string;
+  /** Project namespace. When omitted, uses the server's default project. */
+  project?: string;
   limit?: number;
   offset?: number;
 }
@@ -280,4 +297,18 @@ export interface GetHistoryResult {
 export interface RestoreMemoryInput {
   memory_id: string;
   history_id: number;
+}
+
+// ---------------------------------------------------------------------------
+// Projects (Ronda 29)
+// ---------------------------------------------------------------------------
+
+export interface ProjectInfo {
+  project: string;
+  count: number;
+}
+
+export interface MigrateToProjectInput {
+  tag: string;
+  project: string;
 }

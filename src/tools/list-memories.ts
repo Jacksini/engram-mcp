@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { MemoryDatabase } from "../db/database.js";
-import { CategoryEnum, CompactParams, SortByParam } from "./schemas.js";
+import { CategoryEnum, CompactParams, SortByParam, ProjectParam } from "./schemas.js";
 
 export function registerListMemories(server: McpServer, db: MemoryDatabase): void {
   server.tool(
@@ -48,13 +48,14 @@ export function registerListMemories(server: McpServer, db: MemoryDatabase): voi
         .string()
         .optional()
         .describe("Valor exacto a buscar en el campo metadata_key via json_extract."),
+      project: ProjectParam,
       ...CompactParams,
     },
-    async ({ category, tag, limit, offset, sort_by, created_after, created_before, updated_after, updated_before, metadata_key, metadata_value, compact, content_preview_len }) => {
+    async ({ category, tag, limit, offset, sort_by, created_after, created_before, updated_after, updated_before, metadata_key, metadata_value, project, compact, content_preview_len }) => {
       const resolvedLimit = limit ?? 10;
       const resolvedOffset = offset ?? 0;
       const { memories, total } = db.listWithTotal({
-        category, tag,
+        category, tag, project,
         limit: resolvedLimit, offset: resolvedOffset,
         sort_by, created_after, created_before, updated_after, updated_before,
         metadata_key, metadata_value,

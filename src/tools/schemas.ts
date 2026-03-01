@@ -82,6 +82,14 @@ export function requireAtLeastOneUpdateField(
 }
 
 // ---------------------------------------------------------------------------
+// Project namespace param — spread into every tool's param object
+// ---------------------------------------------------------------------------
+export const ProjectParam = z
+  .string()
+  .optional()
+  .describe("Proyecto al que pertenece la memoria. Si se omite, usa el proyecto por defecto del servidor.");
+
+// ---------------------------------------------------------------------------
 // Compact mode + content preview — spread into tool param objects
 // Used by: list_memories, search_memories, get_memories
 // ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { MemoryDatabase } from "../db/database.js";
+import { ProjectParam } from "./schemas.js";
 
 const RELATION_TYPES = ["caused", "references", "supersedes", "related"] as const;
 
@@ -25,9 +26,10 @@ export function registerGetGraph(server: McpServer, db: MemoryDatabase): void {
         .describe(
           "Filtrar el grafo a un único tipo de relación: caused | references | supersedes | related."
         ),
+      project: ProjectParam,
     },
-    async ({ include_orphans, relation }) => {
-      const result = db.getGraph({ include_orphans, relation });
+    async ({ include_orphans, relation, project }) => {
+      const result = db.getGraph({ include_orphans, relation, project });
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
       };

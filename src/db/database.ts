@@ -36,6 +36,8 @@ import type {
   GetHistoryResult,
   MemoryHistoryEntry,
   RestoreMemoryInput,
+  ProjectInfo,
+  MigrateToProjectInput,
 } from "../types/memory.js";
 
 
@@ -45,6 +47,7 @@ interface MemoryRow {
   category: string;
   tags: string;
   metadata: string;
+  project: string;
   created_at: string;
   updated_at: string;
   expires_at: string | null;
@@ -65,6 +68,7 @@ interface HistoryRow {
   category: string;
   tags: string;
   metadata: string;
+  project: string;
   expires_at: string | null;
   changed_at: string;
   total_count?: number;
@@ -77,6 +81,8 @@ export class MemoryDatabase {
   private readonly db: Database.Database;
   /** Absolute path to the SQLite file, or ':memory:' for in-memory databases. */
   readonly dbPath: string;
+  /** Default project namespace for all operations when not explicitly specified. */
+  readonly defaultProject: string;
 
   // Prepared statements cached at construction time for maximum performance
   private readonly stmtCreate: Statement;
@@ -103,15 +109,12 @@ export class MemoryDatabase {
   private readonly stmtHistoryRows: Statement;
   private readonly stmtHistoryEntry: Statement;
 
-  // listWithTotal stmts: key="${filterFlags}_${sortBy}" where flags c=category t=tag m=meta
-  // 8 filter combos × 3 sort orders = 24 prepared statements
-  private readonly listWTStmts = new Map<string, Statement>();
-  // searchWithTotal stmts: key="${filterFlags}" where flags c=category t=tag m=meta
-  // 8 filter combos, each with optional date range, always FTS rank-ordered
-  private readonly searchWTStmts = new Map<string, Statement>();
+  // Lazy statement cache: key → compiled statement. Built on first use.
+  private readonly stmtCache = new Map<string, Statement>();
 
-  constructor(dbPath: string = DEFAULT_DB_PATH) {
+  constructor(dbPath: string = DEFAULT_DB_PATH, project?: string) {
     this.dbPath = dbPath;
+    this.defaultProject = project ?? process.env["ENGRAM_PROJECT"] ?? "default";
     if (dbPath !== ":memory:") {
       mkdirSync(dirname(dbPath), { recursive: true });
     }
@@ -120,8 +123,8 @@ export class MemoryDatabase {
 
     // Pre-compile all fixed statements; RETURNING avoids an extra SELECT round-trip
     this.stmtCreate = this.db.prepare(
-      `INSERT INTO memories (id, content, category, tags, metadata, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO memories (id, content, category, tags, metadata, project, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
        RETURNING *`
     );
     this.stmtGetById = this.db.prepare(
@@ -142,18 +145,17 @@ export class MemoryDatabase {
     );
 
     // Window-function query: category count + row rank in a single pass.
-    // SQLite supports window functions since 3.25.0 (2018); better-sqlite3 bundles 3.46+.
-    // rowid as tiebreaker guarantees stable ordering when created_at ties (sub-second inserts).
+    // Scoped to a specific project.
     this.stmtSnapshot = this.db.prepare(
-      `SELECT id, content, category, tags,
+      `SELECT id, content, category, tags, project,
               COUNT(*) OVER (PARTITION BY category) AS cat_count,
               ROW_NUMBER() OVER (PARTITION BY category ORDER BY created_at DESC, rowid DESC) AS rn
        FROM memories
-       WHERE (expires_at IS NULL OR expires_at > datetime('now'))`
+       WHERE project = ? AND (expires_at IS NULL OR expires_at > datetime('now'))`
     );
 
     this.stmtTagFreq = this.db.prepare(
-      "SELECT json_each.value AS tag FROM memories, json_each(memories.tags) WHERE (expires_at IS NULL OR expires_at > datetime('now'))"
+      "SELECT json_each.value AS tag FROM memories, json_each(memories.tags) WHERE project = ? AND (expires_at IS NULL OR expires_at > datetime('now'))"
     );
 
     this.stmtPurgeExpired = this.db.prepare(
@@ -197,62 +199,19 @@ export class MemoryDatabase {
     this.stmtHistoryEntry = this.db.prepare(
       "SELECT * FROM memory_history WHERE history_id = ? AND memory_id = ?"
     );
+  }
 
-    // Alias for this.db.prepare — keeps the Map-building loop concise
-    const p = (sql: string) => this.db.prepare(sql);
-
-    const EXPIRES_ALIVE   = "(expires_at IS NULL OR expires_at > datetime('now'))";
-    const EXPIRES_ALIVE_M = "(m.expires_at IS NULL OR m.expires_at > datetime('now'))";
-    const TAG_EXISTS  = "EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?)";
-    const FTS_TAG     = "EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?)";
-    const WT_SEL      = "SELECT *, COUNT(*) OVER () AS total_count";
-    const META_COND   = "json_extract(metadata, '$.' || ?) = ?";
-    const META_COND_M = "json_extract(m.metadata, '$.' || ?) = ?";
-    // Pass null to disable date filters; ISO string to enable
-    // Each date axis has two bounds: after (>=) and before (<=).
-    // Param order per bound pair: col_after, col_after, col_before, col_before
-    const DATE_COND   = "(? IS NULL OR created_at >= ?) AND (? IS NULL OR created_at <= ?) AND (? IS NULL OR updated_at >= ?) AND (? IS NULL OR updated_at <= ?)";
-    const DATE_COND_M = "(? IS NULL OR m.created_at >= ?) AND (? IS NULL OR m.created_at <= ?) AND (? IS NULL OR m.updated_at >= ?) AND (? IS NULL OR m.updated_at <= ?)";
-
-    // Build listWithTotal: 8 filter combos × 3 sort orders = 24 entries
-    // Param order per combo: [...category?, ...tag?, ...meta_key+val?, ca, ca, cb, cb, ua, ua, ub, ub, limit, offset]
-    const SORT_ORDERS: Record<string, string> = {
-      created_at_desc: "ORDER BY created_at DESC, rowid DESC",
-      created_at_asc:  "ORDER BY created_at ASC,  rowid ASC",
-      updated_at_desc: "ORDER BY updated_at DESC, rowid DESC",
-    };
-    for (const [sk, order] of Object.entries(SORT_ORDERS)) {
-      this.listWTStmts.set(`_${sk}`,   p(`${WT_SEL} FROM memories WHERE ${EXPIRES_ALIVE} AND ${DATE_COND} ${order} LIMIT ? OFFSET ?`));
-      this.listWTStmts.set(`c_${sk}`,  p(`${WT_SEL} FROM memories WHERE ${EXPIRES_ALIVE} AND category = ? AND ${DATE_COND} ${order} LIMIT ? OFFSET ?`));
-      this.listWTStmts.set(`t_${sk}`,  p(`${WT_SEL} FROM memories WHERE ${EXPIRES_ALIVE} AND ${TAG_EXISTS} AND ${DATE_COND} ${order} LIMIT ? OFFSET ?`));
-      this.listWTStmts.set(`ct_${sk}`, p(`${WT_SEL} FROM memories WHERE ${EXPIRES_ALIVE} AND category = ? AND ${TAG_EXISTS} AND ${DATE_COND} ${order} LIMIT ? OFFSET ?`));
-      this.listWTStmts.set(`m_${sk}`,  p(`${WT_SEL} FROM memories WHERE ${EXPIRES_ALIVE} AND ${META_COND} AND ${DATE_COND} ${order} LIMIT ? OFFSET ?`));
-      this.listWTStmts.set(`cm_${sk}`, p(`${WT_SEL} FROM memories WHERE ${EXPIRES_ALIVE} AND category = ? AND ${META_COND} AND ${DATE_COND} ${order} LIMIT ? OFFSET ?`));
-      this.listWTStmts.set(`tm_${sk}`, p(`${WT_SEL} FROM memories WHERE ${EXPIRES_ALIVE} AND ${TAG_EXISTS} AND ${META_COND} AND ${DATE_COND} ${order} LIMIT ? OFFSET ?`));
-      this.listWTStmts.set(`ctm_${sk}`,p(`${WT_SEL} FROM memories WHERE ${EXPIRES_ALIVE} AND category = ? AND ${TAG_EXISTS} AND ${META_COND} AND ${DATE_COND} ${order} LIMIT ? OFFSET ?`));
+  /**
+   * Get or compile a prepared statement on first use, then cache it.
+   * Avoids the combinatorial explosion of pre-compiling every filter combo upfront.
+   */
+  private getOrPrepare(key: string, sql: string): Statement {
+    let stmt = this.stmtCache.get(key);
+    if (!stmt) {
+      stmt = this.db.prepare(sql);
+      this.stmtCache.set(key, stmt);
     }
-
-    // Build searchWithTotal: 8 filter combos × 4 sort orders = 32 entries
-    // Sort key "" = default FTS rank; other keys = date-based sorts.
-    // Param order: [ftsQuery, ...category?, ...tag?, ...meta_key+val?, ca, ca, cb, cb, ua, ua, ub, ub, limit, offset]
-    const SEARCH_SORT_ORDERS: Record<string, string> = {
-      "":               "ORDER BY rank",
-      "created_at_desc": "ORDER BY m.created_at DESC, m.rowid DESC",
-      "created_at_asc":  "ORDER BY m.created_at ASC,  m.rowid ASC",
-      "updated_at_desc": "ORDER BY m.updated_at DESC, m.rowid DESC",
-    };
-    const FTS_WT = `SELECT m.*, COUNT(*) OVER () AS total_count FROM memories m JOIN memories_fts fts ON m.rowid = fts.rowid WHERE memories_fts MATCH ? AND ${EXPIRES_ALIVE_M}`;
-    for (const [ss, sorder] of Object.entries(SEARCH_SORT_ORDERS)) {
-      const sk = ss ? `_${ss}` : "";
-      this.searchWTStmts.set(`${sk}`,     p(`${FTS_WT} AND ${DATE_COND_M} ${sorder} LIMIT ? OFFSET ?`));
-      this.searchWTStmts.set(`c${sk}`,    p(`${FTS_WT} AND m.category = ? AND ${DATE_COND_M} ${sorder} LIMIT ? OFFSET ?`));
-      this.searchWTStmts.set(`t${sk}`,    p(`${FTS_WT} AND ${FTS_TAG} AND ${DATE_COND_M} ${sorder} LIMIT ? OFFSET ?`));
-      this.searchWTStmts.set(`ct${sk}`,   p(`${FTS_WT} AND m.category = ? AND ${FTS_TAG} AND ${DATE_COND_M} ${sorder} LIMIT ? OFFSET ?`));
-      this.searchWTStmts.set(`m${sk}`,    p(`${FTS_WT} AND ${META_COND_M} AND ${DATE_COND_M} ${sorder} LIMIT ? OFFSET ?`));
-      this.searchWTStmts.set(`cm${sk}`,   p(`${FTS_WT} AND m.category = ? AND ${META_COND_M} AND ${DATE_COND_M} ${sorder} LIMIT ? OFFSET ?`));
-      this.searchWTStmts.set(`tm${sk}`,   p(`${FTS_WT} AND ${FTS_TAG} AND ${META_COND_M} AND ${DATE_COND_M} ${sorder} LIMIT ? OFFSET ?`));
-      this.searchWTStmts.set(`ctm${sk}`,  p(`${FTS_WT} AND m.category = ? AND ${FTS_TAG} AND ${META_COND_M} AND ${DATE_COND_M} ${sorder} LIMIT ? OFFSET ?`));
-    }
+    return stmt;
   }
 
   private initialize(): void {
@@ -322,6 +281,40 @@ export class MemoryDatabase {
       `);
       this.db.pragma("user_version = 3");
     }
+    if (dbVersion < 4) {
+      // v4: project column for multi-project isolation (Ronda 29)
+      const memCols = (this.db.prepare("PRAGMA table_info(memories)").all() as Array<{ name: string }>).map(c => c.name);
+      if (!memCols.includes("project")) {
+        this.db.exec("ALTER TABLE memories ADD COLUMN project TEXT NOT NULL DEFAULT 'default';");
+      }
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project);");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_memories_project_category ON memories(project, category);");
+
+      const histCols = (this.db.prepare("PRAGMA table_info(memory_history)").all() as Array<{ name: string }>).map(c => c.name);
+      if (!histCols.includes("project")) {
+        this.db.exec("ALTER TABLE memory_history ADD COLUMN project TEXT NOT NULL DEFAULT 'default';");
+      }
+
+      // Recreate history triggers to include project column
+      this.db.exec(`
+        DROP TRIGGER IF EXISTS memories_history_ai;
+        DROP TRIGGER IF EXISTS memories_history_au;
+        DROP TRIGGER IF EXISTS memories_history_ad;
+        CREATE TRIGGER memories_history_ai AFTER INSERT ON memories BEGIN
+          INSERT INTO memory_history (memory_id, operation, content, category, tags, metadata, project, expires_at)
+          VALUES (new.id, 'create', new.content, new.category, new.tags, new.metadata, new.project, new.expires_at);
+        END;
+        CREATE TRIGGER memories_history_au AFTER UPDATE ON memories BEGIN
+          INSERT INTO memory_history (memory_id, operation, content, category, tags, metadata, project, expires_at)
+          VALUES (new.id, 'update', new.content, new.category, new.tags, new.metadata, new.project, new.expires_at);
+        END;
+        CREATE TRIGGER memories_history_ad AFTER DELETE ON memories BEGIN
+          INSERT INTO memory_history (memory_id, operation, content, category, tags, metadata, project, expires_at)
+          VALUES (old.id, 'delete', old.content, old.category, old.tags, old.metadata, old.project, old.expires_at);
+        END;
+      `);
+      this.db.pragma("user_version = 4");
+    }
   }
 
   /** Normalize category: trim + lowercase, default "general" */
@@ -376,11 +369,12 @@ export class MemoryDatabase {
     const category = this.normalizeCategory(input.category);
     const tags = JSON.stringify(this.normalizeTags(input.tags));
     const metadata = JSON.stringify(input.metadata ?? {});
+    const project = input.project ?? this.defaultProject;
     const expires_at = input.expires_at ?? null;
 
     // RETURNING * eliminates the extra getById round-trip
     const row = this.stmtCreate.get(
-      id, content, category, tags, metadata, expires_at
+      id, content, category, tags, metadata, project, expires_at
     ) as MemoryRow;
 
     return this.rowToMemory(row);
@@ -499,6 +493,7 @@ export class MemoryDatabase {
   searchWithTotal(input: SearchMemoriesInput): { memories: Memory[]; total: number } {
     const { query, tag, limit = 10, mode = "any", near_distance = 10 } = input;
     const category = input.category ? input.category.trim().toLowerCase() : undefined;
+    const project = input.project ?? this.defaultProject;
 
     const ftsQuery = this.buildFtsQuery(query, mode, near_distance);
     if (!ftsQuery) return { memories: [], total: 0 };
@@ -513,10 +508,31 @@ export class MemoryDatabase {
     const ub = input.updated_before ?? null;
     const sortKey = input.sort_by ?? "";
 
-    const fk = `${category ? "c" : ""}${tag ? "t" : ""}${hasMeta ? "m" : ""}${sortKey ? `_${sortKey}` : ""}`;
-    const stmt = this.searchWTStmts.get(fk)!;
+    const EXPIRES_ALIVE_M = "(m.expires_at IS NULL OR m.expires_at > datetime('now'))";
+    const FTS_TAG     = "EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?)";
+    const META_COND_M = "json_extract(m.metadata, '$.' || ?) = ?";
+    const DATE_COND_M = "(? IS NULL OR m.created_at >= ?) AND (? IS NULL OR m.created_at <= ?) AND (? IS NULL OR m.updated_at >= ?) AND (? IS NULL OR m.updated_at <= ?)";
+    const SEARCH_SORT_ORDERS: Record<string, string> = {
+      "":               "ORDER BY rank",
+      "created_at_desc": "ORDER BY m.created_at DESC, m.rowid DESC",
+      "created_at_asc":  "ORDER BY m.created_at ASC,  m.rowid ASC",
+      "updated_at_desc": "ORDER BY m.updated_at DESC, m.rowid DESC",
+    };
 
-    const params: unknown[] = [ftsQuery];
+    const fk = `search_${category ? "c" : ""}${tag ? "t" : ""}${hasMeta ? "m" : ""}${sortKey ? `_${sortKey}` : ""}`;
+
+    const stmt = this.getOrPrepare(fk, (() => {
+      const FTS_WT = `SELECT m.*, COUNT(*) OVER () AS total_count FROM memories m JOIN memories_fts fts ON m.rowid = fts.rowid WHERE memories_fts MATCH ? AND m.project = ? AND ${EXPIRES_ALIVE_M}`;
+      const conds: string[] = [];
+      if (category) conds.push("m.category = ?");
+      if (tag) conds.push(FTS_TAG);
+      if (hasMeta) conds.push(META_COND_M);
+      conds.push(DATE_COND_M);
+      const sorder = SEARCH_SORT_ORDERS[sortKey] ?? "ORDER BY rank";
+      return `${FTS_WT}${conds.length ? " AND " + conds.join(" AND ") : ""} ${sorder} LIMIT ? OFFSET ?`;
+    })());
+
+    const params: unknown[] = [ftsQuery, project];
     if (category) params.push(category);
     if (tag) params.push(tag);
     if (hasMeta) params.push(mk, mv);
@@ -559,18 +575,21 @@ export class MemoryDatabase {
     recentPerCategory = 3,
     contentPreviewLen?: number,
     includeTagsIndex = true,
+    project?: string,
   ): ContextSnapshot {
+    const proj = project ?? this.defaultProject;
     type SnapshotRow = {
       id: string;
       content: string;
       category: string;
       tags: string;
+      project: string;
       cat_count: number;
       rn: number;
     };
 
     // Single pass over the table: window functions compute count + rank atomically
-    const rows = this.stmtSnapshot.all() as SnapshotRow[];
+    const rows = this.stmtSnapshot.all(proj) as SnapshotRow[];
 
     const by_category: ContextSnapshot["by_category"] = {};
     let total = 0;
@@ -591,6 +610,7 @@ export class MemoryDatabase {
           content,
           category: row.category,
           tags: JSON.parse(row.tags) as string[],
+          project: row.project,
         } satisfies MemorySlim);
       }
     }
@@ -598,7 +618,7 @@ export class MemoryDatabase {
     // Tag frequency index: flatten all tag arrays via json_each (skipped if not needed)
     const tags_index: Record<string, number> = {};
     if (includeTagsIndex) {
-      const tagRows = this.stmtTagFreq.all() as { tag: string }[];
+      const tagRows = this.stmtTagFreq.all(proj) as { tag: string }[];
       for (const { tag } of tagRows) {
         tags_index[tag] = (tags_index[tag] ?? 0) + 1;
       }
@@ -615,6 +635,7 @@ export class MemoryDatabase {
   listWithTotal(input: ListMemoriesInput = {}): { memories: Memory[]; total: number } {
     const { tag, limit = 10, offset = 0 } = input;
     const category = input.category ? input.category.trim().toLowerCase() : undefined;
+    const project = input.project ?? this.defaultProject;
     const mk = input.metadata_key;
     const mv = input.metadata_value;
     const hasMeta = mk !== undefined && mv !== undefined;
@@ -624,10 +645,30 @@ export class MemoryDatabase {
     const ua = input.updated_after ?? null;
     const ub = input.updated_before ?? null;
 
-    const fk = `${category ? "c" : ""}${tag ? "t" : ""}${hasMeta ? "m" : ""}_${sortBy}`;
-    const stmt = this.listWTStmts.get(fk)!;
+    const EXPIRES_ALIVE = "(expires_at IS NULL OR expires_at > datetime('now'))";
+    const TAG_EXISTS    = "EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ?)";
+    const META_COND     = "json_extract(metadata, '$.' || ?) = ?";
+    const DATE_COND     = "(? IS NULL OR created_at >= ?) AND (? IS NULL OR created_at <= ?) AND (? IS NULL OR updated_at >= ?) AND (? IS NULL OR updated_at <= ?)";
+    const SORT_ORDERS: Record<string, string> = {
+      created_at_desc: "ORDER BY created_at DESC, rowid DESC",
+      created_at_asc:  "ORDER BY created_at ASC,  rowid ASC",
+      updated_at_desc: "ORDER BY updated_at DESC, rowid DESC",
+    };
 
-    const params: unknown[] = [];
+    const fk = `list_${category ? "c" : ""}${tag ? "t" : ""}${hasMeta ? "m" : ""}_${sortBy}`;
+
+    const stmt = this.getOrPrepare(fk, (() => {
+      const WT_SEL = "SELECT *, COUNT(*) OVER () AS total_count";
+      const conds: string[] = [EXPIRES_ALIVE, "project = ?"];
+      if (category) conds.push("category = ?");
+      if (tag) conds.push(TAG_EXISTS);
+      if (hasMeta) conds.push(META_COND);
+      conds.push(DATE_COND);
+      const order = SORT_ORDERS[sortBy] ?? SORT_ORDERS.created_at_desc;
+      return `${WT_SEL} FROM memories WHERE ${conds.join(" AND ")} ${order} LIMIT ? OFFSET ?`;
+    })());
+
+    const params: unknown[] = [project];
     if (category) params.push(category);
     if (tag) params.push(tag);
     if (hasMeta) params.push(mk, mv);
@@ -680,9 +721,9 @@ export class MemoryDatabase {
    * Default limit 10_000 to avoid unbounded memory; callers can lower it.
    */
   exportAll(input: ExportMemoriesInput = {}): Memory[] {
-    const { category, tag } = input;
+    const { category, tag, project } = input;
     const limit = input.limit ?? 10_000;
-    return this.listWithTotal({ category, tag, limit, offset: 0, sort_by: "created_at_asc" }).memories;
+    return this.listWithTotal({ category, tag, project, limit, offset: 0, sort_by: "created_at_asc" }).memories;
   }
 
   /**
@@ -721,6 +762,7 @@ export class MemoryDatabase {
           category: row.category,
           tags: row.tags,
           metadata: row.metadata,
+          project: row.project,
         });
         ids.push(created.id);
       }
@@ -735,11 +777,13 @@ export class MemoryDatabase {
    * Compute aggregate statistics about the memories database.
    * Uses 3 SQL queries: category counts, tag frequency, and scalar aggregates.
    */
-  getStats(): StatsResult {
+  getStats(project?: string): StatsResult {
+    const proj = project ?? this.defaultProject;
+
     // --- Category counts ---
     const catRows = this.db.prepare(
-      "SELECT category, COUNT(*) AS cnt FROM memories GROUP BY category ORDER BY cnt DESC"
-    ).all() as Array<{ category: string; cnt: number }>;
+      "SELECT category, COUNT(*) AS cnt FROM memories WHERE project = ? GROUP BY category ORDER BY cnt DESC"
+    ).all(proj) as Array<{ category: string; cnt: number }>;
 
     const by_category: Record<string, number> = {};
     let total = 0;
@@ -752,8 +796,9 @@ export class MemoryDatabase {
     const tagRows = this.db.prepare(
       `SELECT json_each.value AS tag, COUNT(*) AS cnt
        FROM memories, json_each(memories.tags)
+       WHERE project = ?
        GROUP BY tag ORDER BY cnt DESC LIMIT 20`
-    ).all() as Array<{ tag: string; cnt: number }>;
+    ).all(proj) as Array<{ tag: string; cnt: number }>;
     const top_tags = tagRows.map(({ tag, cnt }) => ({ tag, count: cnt }));
 
     // --- Scalar aggregates ---
@@ -762,16 +807,16 @@ export class MemoryDatabase {
          AVG(LENGTH(content))       AS avg_len,
          SUM(CASE WHEN tags = '[]'     THEN 1 ELSE 0 END) AS no_tags,
          SUM(CASE WHEN metadata = '{}' THEN 1 ELSE 0 END) AS no_meta
-       FROM memories`
-    ).get() as { avg_len: number | null; no_tags: number; no_meta: number } | undefined;
+       FROM memories WHERE project = ?`
+    ).get(proj) as { avg_len: number | null; no_tags: number; no_meta: number } | undefined;
 
     const avg_content_len = agg?.avg_len != null ? Math.round(agg.avg_len) : 0;
     const memories_without_tags     = agg?.no_tags ?? 0;
     const memories_without_metadata = agg?.no_meta ?? 0;
 
     // --- Oldest / newest ---
-    const oldestRow = this.db.prepare("SELECT * FROM memories ORDER BY created_at ASC,  rowid ASC  LIMIT 1").get() as MemoryRow | undefined;
-    const newestRow = this.db.prepare("SELECT * FROM memories ORDER BY created_at DESC, rowid DESC LIMIT 1").get() as MemoryRow | undefined;
+    const oldestRow = this.db.prepare("SELECT * FROM memories WHERE project = ? ORDER BY created_at ASC,  rowid ASC  LIMIT 1").get(proj) as MemoryRow | undefined;
+    const newestRow = this.db.prepare("SELECT * FROM memories WHERE project = ? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(proj) as MemoryRow | undefined;
 
     return {
       total,
@@ -885,7 +930,8 @@ export class MemoryDatabase {
    * already has the new tag. FTS is updated automatically via the memories_au trigger.
    * Returns the number of updated memories and the old/new tag names.
    */
-  renameTag(oldTag: string, newTag: string): RenameTagResult {
+  renameTag(oldTag: string, newTag: string, project?: string): RenameTagResult {
+    const proj = project ?? this.defaultProject;
     const rows = this.db.prepare(
       `UPDATE memories
        SET tags = (
@@ -893,9 +939,9 @@ export class MemoryDatabase {
          FROM json_each(memories.tags)
        ),
        updated_at = datetime('now')
-       WHERE EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE value = ?)
+       WHERE project = ? AND EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE value = ?)
        RETURNING id`
-    ).all(oldTag, newTag, oldTag) as Array<{ id: string }>;
+    ).all(oldTag, newTag, proj, oldTag) as Array<{ id: string }>;
 
     return { updated: rows.length, old_tag: oldTag, new_tag: newTag };
   }
@@ -946,6 +992,7 @@ export class MemoryDatabase {
       category: row.category,
       tags: JSON.parse(row.tags) as string[],
       metadata: JSON.parse(row.metadata) as Record<string, unknown>,
+      project: row.project,
       expires_at: row.expires_at,
       changed_at: row.changed_at,
     };
@@ -1005,12 +1052,25 @@ export class MemoryDatabase {
    * relation → restrict edges (and thus nodes) to a specific relation type.
    */
   getGraph(input: GetGraphInput = {}): GraphResult {
-    const { include_orphans = false, relation } = input;
+    const { include_orphans = false, relation, project } = input;
+    const proj = project ?? this.defaultProject;
 
-    // Fetch edges (optionally filtered by relation type)
+    // Fetch edges scoped to project (only edges where both memories belong to the project)
     const edgeRows = relation
-      ? (this.db.prepare("SELECT from_id, to_id, relation FROM memory_links WHERE relation = ? ORDER BY created_at DESC").all(relation) as GraphEdge[])
-      : (this.db.prepare("SELECT from_id, to_id, relation FROM memory_links ORDER BY created_at DESC").all() as GraphEdge[]);
+      ? (this.db.prepare(
+          `SELECT l.from_id, l.to_id, l.relation FROM memory_links l
+           JOIN memories m1 ON l.from_id = m1.id
+           JOIN memories m2 ON l.to_id = m2.id
+           WHERE l.relation = ? AND m1.project = ? AND m2.project = ?
+           ORDER BY l.created_at DESC`
+        ).all(relation, proj, proj) as GraphEdge[])
+      : (this.db.prepare(
+          `SELECT l.from_id, l.to_id, l.relation FROM memory_links l
+           JOIN memories m1 ON l.from_id = m1.id
+           JOIN memories m2 ON l.to_id = m2.id
+           WHERE m1.project = ? AND m2.project = ?
+           ORDER BY l.created_at DESC`
+        ).all(proj, proj) as GraphEdge[]);
 
     const edges: GraphEdge[] = edgeRows;
 
@@ -1026,13 +1086,13 @@ export class MemoryDatabase {
     const ALIVE = "(expires_at IS NULL OR expires_at > datetime('now'))";
     if (include_orphans) {
       nodeRows = this.db.prepare(
-        `SELECT * FROM memories WHERE ${ALIVE} ORDER BY created_at DESC`
-      ).all() as MemoryRow[];
+        `SELECT * FROM memories WHERE project = ? AND ${ALIVE} ORDER BY created_at DESC`
+      ).all(proj) as MemoryRow[];
     } else if (linkedIds.size > 0) {
       const placeholders = Array.from(linkedIds).map(() => "?").join(", ");
       nodeRows = this.db.prepare(
-        `SELECT * FROM memories WHERE id IN (${placeholders}) AND ${ALIVE}`
-      ).all(...Array.from(linkedIds)) as MemoryRow[];
+        `SELECT * FROM memories WHERE id IN (${placeholders}) AND project = ? AND ${ALIVE}`
+      ).all(...Array.from(linkedIds), proj) as MemoryRow[];
     } else {
       nodeRows = [];
     }
@@ -1053,6 +1113,34 @@ export class MemoryDatabase {
       edges,
       mermaid,
     };
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Projects API (Ronda 29)
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * List all distinct projects and their memory counts.
+   */
+  listProjects(): ProjectInfo[] {
+    return this.db.prepare(
+      "SELECT project, COUNT(*) AS count FROM memories GROUP BY project ORDER BY count DESC"
+    ).all() as ProjectInfo[];
+  }
+
+  /**
+   * Move memories that carry a specific tag into a target project.
+   * Returns the number of memories updated.
+   */
+  migrateToProject(input: MigrateToProjectInput): number {
+    const { tag, project } = input;
+    const rows = this.db.prepare(
+      `UPDATE memories
+       SET project = ?, updated_at = datetime('now')
+       WHERE EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE value = ?)
+       RETURNING id`
+    ).all(project, tag) as Array<{ id: string }>;
+    return rows.length;
   }
 
   /**

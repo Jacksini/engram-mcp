@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { MemoryDatabase } from "../db/database.js";
+import { ProjectParam } from "./schemas.js";
 
 export function registerRenameTag(server: McpServer, db: MemoryDatabase): void {
   server.tool(
@@ -18,8 +19,9 @@ export function registerRenameTag(server: McpServer, db: MemoryDatabase): void {
         .string()
         .min(1, "new_tag no puede estar vacío")
         .describe("Nuevo nombre para el tag."),
+      project: ProjectParam,
     },
-    async ({ old_tag, new_tag }) => {
+    async ({ old_tag, new_tag, project }) => {
       if (old_tag === new_tag) {
         return {
           content: [
@@ -31,7 +33,7 @@ export function registerRenameTag(server: McpServer, db: MemoryDatabase): void {
         };
       }
 
-      const result = db.renameTag(old_tag, new_tag);
+      const result = db.renameTag(old_tag, new_tag, project);
       return {
         content: [
           {

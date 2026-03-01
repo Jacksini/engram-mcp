@@ -26,6 +26,8 @@ import { registerBackup } from "./backup.js";
 import { registerGetGraph } from "./get-graph.js";
 import { registerGetHistory } from "./get-history.js";
 import { registerRestoreMemory } from "./restore-memory.js";
+import { registerListProjects } from "./list-projects.js";
+import { registerMigrateToProject } from "./migrate-to-project.js";
 
 export function registerAllTools(server: McpServer, db: MemoryDatabase): void {
   registerSaveMemory(server, db);
@@ -54,4 +56,6 @@ export function registerAllTools(server: McpServer, db: MemoryDatabase): void {
   registerGetGraph(server, db);
   registerGetHistory(server, db);
   registerRestoreMemory(server, db);
+  registerListProjects(server, db);
+  registerMigrateToProject(server, db);
 }

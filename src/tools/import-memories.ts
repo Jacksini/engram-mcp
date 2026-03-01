@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { MemoryDatabase } from "../db/database.js";
-import { MemoryInputSchema } from "./schemas.js";
+import { MemoryInputSchema, ProjectParam } from "./schemas.js";
 
 const ImportRowSchema = z.object({
   id: z.string().uuid().optional().describe("ID existente. Solo relevante en modo 'upsert'."),
@@ -22,9 +22,11 @@ export function registerImportMemories(server: McpServer, db: MemoryDatabase): v
         .enum(["insert", "upsert"])
         .optional()
         .describe("'insert' (default): siempre crea nuevas. 'upsert': actualiza si el id ya existe."),
+      project: ProjectParam,
     },
-    async ({ memories, mode }) => {
-      const result = db.importBatch(memories, mode ?? "insert");
+    async ({ memories, mode, project }) => {
+      const inputs = memories.map(m => ({ ...m, project }));
+      const result = db.importBatch(inputs, mode ?? "insert");
       return {
         content: [
           {
