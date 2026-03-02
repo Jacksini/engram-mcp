@@ -24,8 +24,22 @@ async function main() {
   await server.connect(transport);
   console.error("Servidor MCP iniciado con base de datos de memorias");
 
-  // Graceful shutdown: close the DB so SQLite can flush the WAL and release locks
+  // Periodic maintenance (4.1): purge expired every 5 min, optimize FTS every 30 min
+  const purgeInterval = setInterval(() => {
+    const result = db.purgeExpired();
+    if (result.purged > 0) {
+      console.error(`Periodic purge: ${result.purged} expired memor${result.purged === 1 ? "y" : "ies"} removed.`);
+    }
+  }, 5 * 60 * 1000);
+
+  const ftsInterval = setInterval(() => {
+    db.optimizeFts();
+  }, 30 * 60 * 1000);
+
+  // Graceful shutdown: clear intervals and close the DB so SQLite can flush the WAL
   const shutdown = () => {
+    clearInterval(purgeInterval);
+    clearInterval(ftsInterval);
     db.close();
     process.exit(0);
   };

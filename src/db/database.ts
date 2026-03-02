@@ -836,6 +836,15 @@ export class MemoryDatabase {
   }
 
   /**
+   * Optimize the FTS5 index.
+   * Should be called periodically (e.g. every 30 min) to merge FTS segments
+   * and keep full-text search queries fast.
+   */
+  optimizeFts(): void {
+    this.db.exec("INSERT INTO memories_fts(memories_fts) VALUES('optimize');");
+  }
+
+  /**
    * Export all memories matching optional filters as a raw array.
    * Reuses listWithTotal with a high ceiling — no extra SQL needed.
    * Default limit 10_000 to avoid unbounded memory; callers can lower it.
