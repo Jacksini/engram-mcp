@@ -9,6 +9,12 @@ export interface Memory {
   updated_at: string;
   /** ISO datetime string. Null means no expiration. */
   expires_at: string | null;
+  /**
+   * Present (and true) only when `deduplicate: true` was passed to create() and
+   * an existing memory with the same content hash was found. The returned object
+   * is the pre-existing memory, not a newly inserted one.
+   */
+  _deduplicated?: boolean;
 }
 
 export interface CreateMemoryInput {
@@ -22,6 +28,13 @@ export interface CreateMemoryInput {
   expires_at?: string | null;
   /** Set to false to skip automatic link inference on creation. Default: true. */
   auto_link?: boolean;
+  /**
+   * When true, compute a SHA-256 hash of the trimmed content and skip insertion
+   * if a memory with the same hash already exists in the same project.
+   * The existing memory is returned with `_deduplicated: true`.
+   * Default: false.
+   */
+  deduplicate?: boolean;
 }
 
 export interface UpdateMemoryInput {

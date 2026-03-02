@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import type { Statement } from "better-sqlite3";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -126,6 +126,9 @@ export class MemoryDatabase {
   private readonly stmtHistoryRows: Statement;
   private readonly stmtHistoryEntry: Statement;
 
+  // Fase 3: deduplication lookup
+  private readonly stmtFindDuplicate: Statement;
+
   // Lazy statement cache: key → compiled statement. Built on first use.
   private readonly stmtCache = new Map<string, Statement>();
 
@@ -215,6 +218,13 @@ export class MemoryDatabase {
     );
     this.stmtHistoryEntry = this.db.prepare(
       "SELECT * FROM memory_history WHERE history_id = ? AND memory_id = ?"
+    );
+
+    // Fase 3: lookup by content_hash for deduplication
+    this.stmtFindDuplicate = this.db.prepare(
+      `SELECT * FROM memories
+       WHERE json_extract(metadata, '$.content_hash') = ? AND project = ?
+       LIMIT 1`
     );
   }
 
@@ -344,7 +354,63 @@ export class MemoryDatabase {
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_links_auto ON memory_links(auto_generated);");
       this.db.pragma("user_version = 5");
     }
+    if (dbVersion < 6) {
+      // v6: expression index for content_hash + backfill auto-metadata (Fase 3)
+      this.db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_memories_content_hash ON memories(json_extract(metadata, '$.content_hash'));"
+      );
+      // Backfill: compute content_length, word_count, content_hash for memories without it
+      const backfillRows = this.db.prepare(
+        `SELECT id, content, metadata FROM memories
+         WHERE json_extract(metadata, '$.content_hash') IS NULL`
+      ).all() as Array<{ id: string; content: string; metadata: string }>;
+      const backfillStmt = this.db.prepare(
+        "UPDATE memories SET metadata = ? WHERE id = ?"
+      );
+      const backfillTx = this.db.transaction(() => {
+        for (const r of backfillRows) {
+          const auto = this.computeAutoMetadata(r.content);
+          const existing = JSON.parse(r.metadata) as Record<string, unknown>;
+          const merged = { ...auto, ...existing };
+          backfillStmt.run(JSON.stringify(merged), r.id);
+        }
+      });
+      backfillTx();
+      this.db.pragma("user_version = 6");
+    }
   }
+
+  // ─── Fase 3: Auto-Metadata helpers ─────────────────────────────────────
+
+  /**
+   * Compute auto-metadata fields from raw content string.
+   * - `content_length`: character count (trimmed)
+   * - `word_count`: whitespace-delimited token count
+   * - `content_hash`: first 16 hex chars of SHA-256 (for deduplication)
+   */
+  private computeAutoMetadata(content: string): {
+    content_length: number;
+    word_count: number;
+    content_hash: string;
+  } {
+    const trimmed = content.trim();
+    return {
+      content_length: trimmed.length,
+      word_count: trimmed.split(/\s+/).filter(Boolean).length,
+      content_hash: createHash("sha256").update(trimmed).digest("hex").slice(0, 16),
+    };
+  }
+
+  /**
+   * Return an existing memory that shares the same `content_hash` in the same
+   * project, or null if none found.
+   */
+  private findDuplicate(contentHash: string, project: string): Memory | null {
+    const row = this.stmtFindDuplicate.get(contentHash, project) as MemoryRow | undefined;
+    return row ? this.rowToMemory(row) : null;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
 
   /** Normalize category: trim + lowercase, default "general" */
   private normalizeCategory(category: string | undefined): string {
@@ -397,9 +463,23 @@ export class MemoryDatabase {
     const content = input.content.trim();
     const category = this.normalizeCategory(input.category);
     const tags = JSON.stringify(this.normalizeTags(input.tags));
-    const metadata = JSON.stringify(input.metadata ?? {});
     const project = input.project ?? this.defaultProject;
     const expires_at = input.expires_at ?? null;
+
+    // Fase 3 — Auto-Metadata: merge auto fields (lower priority) with user-supplied metadata
+    const autoMeta = this.computeAutoMetadata(content);
+    const userMeta = input.metadata ?? {};
+    const mergedMeta = { ...autoMeta, ...userMeta };
+
+    // Fase 3 — Deduplication: if requested, look for an existing memory with the same hash
+    if (input.deduplicate) {
+      const existing = this.findDuplicate(autoMeta.content_hash, project);
+      if (existing) {
+        return { ...existing, _deduplicated: true };
+      }
+    }
+
+    const metadata = JSON.stringify(mergedMeta);
 
     // RETURNING * eliminates the extra getById round-trip
     const row = this.stmtCreate.get(
@@ -846,7 +926,8 @@ export class MemoryDatabase {
       `SELECT
          AVG(LENGTH(content))       AS avg_len,
          SUM(CASE WHEN tags = '[]'     THEN 1 ELSE 0 END) AS no_tags,
-         SUM(CASE WHEN metadata = '{}' THEN 1 ELSE 0 END) AS no_meta
+         SUM(CASE WHEN json_remove(metadata, '$.content_hash', '$.content_length', '$.word_count') = '{}'
+                  THEN 1 ELSE 0 END) AS no_meta
        FROM memories WHERE project = ?`
     ).get(proj) as { avg_len: number | null; no_tags: number; no_meta: number } | undefined;
 

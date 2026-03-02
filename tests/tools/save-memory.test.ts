@@ -39,6 +39,6 @@ describe("save_memory tool", () => {
       metadata: { file: "src/routes.ts", line: 42 },
     });
 
-    expect(memory.metadata).toEqual({ file: "src/routes.ts", line: 42 });
+    expect(memory.metadata).toMatchObject({ file: "src/routes.ts", line: 42 });
   });
 });

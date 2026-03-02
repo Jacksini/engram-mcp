@@ -12,9 +12,11 @@ export function registerSaveMemory(server: McpServer, db: MemoryDatabase): void 
       project: ProjectParam,
       auto_link: z.boolean().optional().default(true)
         .describe("Si false, omite la inferencia automática de enlaces al crear. Default: true."),
+      deduplicate: z.boolean().optional().default(false)
+        .describe("Si true, calcula SHA-256 del contenido y devuelve la memoria existente si ya existe en el mismo proyecto (con _deduplicated: true). Default: false."),
     },
-    async ({ content, category, tags, metadata, expires_at, project, auto_link }) => {
-      const memory = db.create({ content, category, tags, metadata, expires_at, project, auto_link });
+    async ({ content, category, tags, metadata, expires_at, project, auto_link, deduplicate }) => {
+      const memory = db.create({ content, category, tags, metadata, expires_at, project, auto_link, deduplicate });
       return {
         content: [
           {

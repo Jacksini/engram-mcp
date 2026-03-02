@@ -16,11 +16,13 @@ export function registerSaveMemories(server: McpServer, db: MemoryDatabase): voi
       project: ProjectParam,
       auto_link: z.boolean().optional().default(true)
         .describe("Si false, omite la inferencia automática de enlaces para todas las memorias del lote. Default: true."),
+      deduplicate: z.boolean().optional().default(false)
+        .describe("Si true, activa la deduplicación por content_hash para todas las memorias del lote. Las memorias duplicadas se devuelven con _deduplicated: true sin insertar de nuevo. Default: false."),
       ...CompactParams,
     },
-    async ({ memories, project, auto_link, compact, content_preview_len }) => {
-      // Apply the tool-level project and auto_link to each memory that doesn't specify its own
-      const inputs = memories.map((m) => ({ ...m, project: project, auto_link }));
+    async ({ memories, project, auto_link, deduplicate, compact, content_preview_len }) => {
+      // Apply the tool-level project, auto_link and deduplicate to each memory that doesn't specify its own
+      const inputs = memories.map((m) => ({ ...m, project: project, auto_link, deduplicate }));
       const created = db.createBatch(inputs);
       const items = created.map(({ id, content, category: cat, tags, ...rest }) => {
         const truncated = content_preview_len != null ? content.slice(0, content_preview_len) : content;

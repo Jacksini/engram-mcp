@@ -21,7 +21,8 @@ describe("MemoryDatabase", () => {
       expect(mem.content).toBe("Test memory");
       expect(mem.category).toBe("general");
       expect(mem.tags).toEqual([]);
-      expect(mem.metadata).toEqual({});
+      // Fase 3: auto-metadata is always present; check no user-supplied keys
+      expect(mem.metadata).toMatchObject({ content_hash: expect.any(String), content_length: 11, word_count: 2 });
       expect(mem.created_at).toBeDefined();
       expect(mem.updated_at).toBeDefined();
     });
@@ -37,7 +38,8 @@ describe("MemoryDatabase", () => {
       expect(mem.content).toBe("Architecture decision");
       expect(mem.category).toBe("decision");
       expect(mem.tags).toEqual(["backend", "api"]);
-      expect(mem.metadata).toEqual({ priority: "high" });
+      // Fase 3: user metadata is merged with auto-metadata (user keys take priority)
+      expect(mem.metadata).toMatchObject({ priority: "high" });
     });
 
     it("trims leading/trailing whitespace from content", () => {
