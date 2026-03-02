@@ -38,8 +38,8 @@ export const SCHEMA_SQL = `
 
   CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
   CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
-  CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project);
-  CREATE INDEX IF NOT EXISTS idx_memories_project_category ON memories(project, category);
+  -- idx_memories_project and idx_memories_project_category are created in the v4 migration
+  -- (they reference the 'project' column which doesn't exist on pre-v4 DBs)
   -- idx_memories_expires_at is created in the v1 migration (after ALTER TABLE on old DBs)
 
   CREATE TABLE IF NOT EXISTS memory_links (
