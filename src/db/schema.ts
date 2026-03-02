@@ -43,10 +43,12 @@ export const SCHEMA_SQL = `
   -- idx_memories_expires_at is created in the v1 migration (after ALTER TABLE on old DBs)
 
   CREATE TABLE IF NOT EXISTS memory_links (
-    from_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    to_id      TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    relation   TEXT NOT NULL DEFAULT 'related',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    from_id        TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    to_id          TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    relation       TEXT NOT NULL DEFAULT 'related',
+    weight         REAL NOT NULL DEFAULT 1.0,
+    auto_generated INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (from_id, to_id)
   );
 

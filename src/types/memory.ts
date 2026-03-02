@@ -20,6 +20,8 @@ export interface CreateMemoryInput {
   project?: string;
   /** Optional expiration. ISO datetime string. Null or omit for no expiration. */
   expires_at?: string | null;
+  /** Set to false to skip automatic link inference on creation. Default: true. */
+  auto_link?: boolean;
 }
 
 export interface UpdateMemoryInput {
@@ -175,6 +177,10 @@ export interface MemoryLink {
   from_id: string;
   to_id: string;
   relation: RelationType;
+  /** Link strength 0.0–1.0. Manual links default to 1.0; auto-generated links carry a computed score. */
+  weight: number;
+  /** 1 if the link was created automatically by the auto-link engine; 0 for manual links. */
+  auto_generated: number;
   created_at: string;
 }
 
@@ -184,12 +190,80 @@ export interface RelatedMemory {
   /** "from" = id → other (id caused/references other), "to" = other → id */
   direction: "from" | "to";
   linked_at: string;
+  /** Link strength 0.0–1.0. */
+  weight: number;
+  /** True if the link was auto-generated. */
+  auto_generated: boolean;
 }
 
 export interface LinkMemoriesInput {
   from_id: string;
   to_id: string;
   relation?: RelationType;
+  /** Link strength 0.0–1.0. Defaults to 1.0 for manual links. */
+  weight?: number;
+  /** Internal flag. Set to 1 only by the auto-link engine. */
+  auto_generated?: number;
+}
+
+// ---------------------------------------------------------------------------
+// get_related_deep — multi-hop traversal (Fase 2)
+// ---------------------------------------------------------------------------
+
+export interface GetRelatedDeepInput {
+  id: string;
+  /** Maximum traversal depth (1–5). Default: 3. */
+  max_depth?: number;
+  relation?: RelationType;
+  /** Project namespace. When omitted, uses the server's default project. */
+  project?: string;
+  /** Max total results to return across all depths. Default: 50. */
+  limit?: number;
+}
+
+export interface RelatedMemoryDeep {
+  memory: Memory;
+  relation: RelationType;
+  /** Hop distance from the origin memory (1 = direct link). */
+  depth: number;
+  weight: number;
+  auto_generated: boolean;
+}
+
+export interface GetRelatedDeepResult {
+  total: number;
+  results: RelatedMemoryDeep[];
+}
+
+// ---------------------------------------------------------------------------
+// suggest_links — link suggestions without creating them (Fase 2)
+// ---------------------------------------------------------------------------
+
+export type SuggestLinkReason = "shared_tags" | "content_similarity" | "temporal_proximity";
+
+export interface SuggestLink {
+  from_id: string;
+  to_id: string;
+  to_content_preview: string;
+  to_category: string;
+  to_tags: string[];
+  suggested_relation: RelationType;
+  weight: number;
+  reason: SuggestLinkReason;
+}
+
+export interface SuggestLinksInput {
+  /** Specific memory to analyse. If omitted, orphan memories in the project are analysed. */
+  id?: string;
+  /** Project namespace. When omitted, uses the server's default project. */
+  project?: string;
+  /** Max suggestions to return. Default: 20. */
+  limit?: number;
+}
+
+export interface SuggestLinksResult {
+  analysed: number;
+  suggestions: SuggestLink[];
 }
 
 export interface GetRelatedInput {

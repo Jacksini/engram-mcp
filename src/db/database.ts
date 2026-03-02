@@ -38,6 +38,13 @@ import type {
   RestoreMemoryInput,
   ProjectInfo,
   MigrateToProjectInput,
+  GetRelatedDeepInput,
+  GetRelatedDeepResult,
+  RelatedMemoryDeep,
+  SuggestLinksInput,
+  SuggestLinksResult,
+  SuggestLink,
+  SuggestLinkReason,
 } from "../types/memory.js";
 
 
@@ -57,6 +64,16 @@ interface MemoryRow {
 interface LinkQueryRow extends MemoryRow {
   relation: string;
   link_created_at: string;
+  weight: number;
+  auto_generated: number;
+}
+
+/** Internal row returned by deep-traversal CTE */
+interface DeepTraversalRow extends MemoryRow {
+  relation: string;
+  depth: number;
+  weight: number;
+  auto_generated: number;
 }
 
 /** Internal row returned by memory_history queries */
@@ -164,16 +181,16 @@ export class MemoryDatabase {
 
     // Relations statements
     const LINKS_SEL_FROM = `
-      SELECT m.*, l.relation, l.created_at AS link_created_at
+      SELECT m.*, l.relation, l.created_at AS link_created_at, l.weight, l.auto_generated
       FROM memory_links l JOIN memories m ON l.to_id = m.id
       WHERE l.from_id = ?`;
     const LINKS_SEL_TO = `
-      SELECT m.*, l.relation, l.created_at AS link_created_at
+      SELECT m.*, l.relation, l.created_at AS link_created_at, l.weight, l.auto_generated
       FROM memory_links l JOIN memories m ON l.from_id = m.id
       WHERE l.to_id = ?`;
 
     this.stmtLinkUpsert = this.db.prepare(
-      "INSERT OR REPLACE INTO memory_links (from_id, to_id, relation) VALUES (?, ?, ?) RETURNING *"
+      "INSERT OR REPLACE INTO memory_links (from_id, to_id, relation, weight, auto_generated) VALUES (?, ?, ?, ?, ?) RETURNING *"
     );
     this.stmtUnlink = this.db.prepare(
       "DELETE FROM memory_links WHERE from_id = ? AND to_id = ? RETURNING from_id"
@@ -315,6 +332,18 @@ export class MemoryDatabase {
       `);
       this.db.pragma("user_version = 4");
     }
+    if (dbVersion < 5) {
+      // v5: weight and auto_generated columns in memory_links (Fase 2 — Conexiones Inteligentes)
+      const linkCols = (this.db.prepare("PRAGMA table_info(memory_links)").all() as Array<{ name: string }>).map(c => c.name);
+      if (!linkCols.includes("weight")) {
+        this.db.exec("ALTER TABLE memory_links ADD COLUMN weight REAL NOT NULL DEFAULT 1.0;");
+      }
+      if (!linkCols.includes("auto_generated")) {
+        this.db.exec("ALTER TABLE memory_links ADD COLUMN auto_generated INTEGER NOT NULL DEFAULT 0;");
+      }
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_links_auto ON memory_links(auto_generated);");
+      this.db.pragma("user_version = 5");
+    }
   }
 
   /** Normalize category: trim + lowercase, default "general" */
@@ -377,7 +406,18 @@ export class MemoryDatabase {
       id, content, category, tags, metadata, project, expires_at
     ) as MemoryRow;
 
-    return this.rowToMemory(row);
+    const memory = this.rowToMemory(row);
+
+    // Fase 2: auto-link unless explicitly opted out
+    if (input.auto_link !== false) {
+      try {
+        this.autoLink(memory);
+      } catch {
+        // Auto-link failures must never surface to the caller
+      }
+    }
+
+    return memory;
   }
 
   /**
@@ -840,8 +880,8 @@ export class MemoryDatabase {
    * is replaced with the new value.
    */
   linkMemories(input: LinkMemoriesInput): MemoryLink {
-    const { from_id, to_id, relation = "related" } = input;
-    const row = this.stmtLinkUpsert.get(from_id, to_id, relation) as MemoryLink;
+    const { from_id, to_id, relation = "related", weight = 1.0, auto_generated = 0 } = input;
+    const row = this.stmtLinkUpsert.get(from_id, to_id, relation, weight, auto_generated) as MemoryLink;
     return row;
   }
 
@@ -893,6 +933,8 @@ export class MemoryDatabase {
           relation: row.relation as RelationType,
           direction: "from",
           linked_at: row.link_created_at,
+          weight: row.weight ?? 1.0,
+          auto_generated: Boolean(row.auto_generated),
         });
       }
     }
@@ -907,11 +949,330 @@ export class MemoryDatabase {
           relation: row.relation as RelationType,
           direction: "to",
           linked_at: row.link_created_at,
+          weight: row.weight ?? 1.0,
+          auto_generated: Boolean(row.auto_generated),
         });
       }
     }
 
     return results;
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Fase 2: Auto-link engine
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Infer and create links for a newly created memory using 3 heuristic strategies.
+   * All errors are silently swallowed so they never affect the caller.
+   *
+   * Strategy A) Shared tags (≥2 in common) → "related", weight = shared_count × 0.3 (capped at 1.0)
+   * Strategy B) FTS5 content similarity (top-5 terms, rank < -0.5) → "references", normalised weight
+   * Strategy C) Temporal proximity ± 1 hour + same category → "related", weight 0.4
+   */
+  private autoLink(memory: Memory): void {
+    const { id, project, tags, category, content, created_at } = memory;
+    const ALIVE = "(m.expires_at IS NULL OR m.expires_at > datetime('now'))";
+
+    // ── Strategy A: shared tags ──────────────────────────────────────────────
+    if (tags.length >= 2) {
+      const rowsA = this.getOrPrepare("autolink_tags", `
+        SELECT m.id, COUNT(*) AS shared_count
+        FROM memories m, json_each(m.tags) je
+        WHERE m.id != ? AND m.project = ? AND ${ALIVE}
+          AND je.value IN (SELECT value FROM json_each(?))
+        GROUP BY m.id
+        HAVING COUNT(*) >= 2
+        ORDER BY shared_count DESC
+        LIMIT 10
+      `).all(id, project, JSON.stringify(tags)) as Array<{ id: string; shared_count: number }>;
+
+      for (const r of rowsA) {
+        const existing = this.stmtGetLink.get(id, r.id);
+        if (!existing) {
+          const weight = Math.min(1.0, r.shared_count * 0.3);
+          this.stmtLinkUpsert.run(id, r.id, "related", weight, 1);
+        }
+      }
+    }
+
+    // ── Strategy B: FTS5 content similarity ─────────────────────────────────
+    const terms = content.split(/\s+/).filter(Boolean).slice(0, 5);
+    if (terms.length >= 2) {
+      const ftsQuery = this.buildFtsQuery(terms.join(" "), "any");
+      if (ftsQuery) {
+        const rowsB = this.getOrPrepare("autolink_fts", `
+          SELECT m.id, ft.rank
+          FROM memories_fts ft JOIN memories m ON ft.rowid = m.rowid
+          WHERE memories_fts MATCH ? AND m.id != ? AND m.project = ?
+            AND ${ALIVE}
+          ORDER BY ft.rank
+          LIMIT 5
+        `).all(ftsQuery, id, project) as Array<{ id: string; rank: number }>;
+
+        for (const r of rowsB) {
+          if (r.rank < -0.5) {
+            const existing = this.stmtGetLink.get(id, r.id);
+            if (!existing) {
+              // Normalise FTS rank (negative, more negative = more relevant) to [0.1, 0.9]
+              const weight = Math.min(0.9, Math.max(0.1, Math.abs(r.rank) / 10));
+              this.stmtLinkUpsert.run(id, r.id, "references", weight, 1);
+            }
+          }
+        }
+      }
+    }
+
+    // ── Strategy C: temporal proximity ± 1 h + same category ────────────────
+    const rowsC = this.getOrPrepare("autolink_temporal", `
+      SELECT id FROM memories
+      WHERE id != ? AND project = ? AND category = ?
+        AND created_at BETWEEN datetime(?, '-1 hour') AND datetime(?, '+1 hour')
+        AND (expires_at IS NULL OR expires_at > datetime('now'))
+      ORDER BY ABS(julianday(created_at) - julianday(?))
+      LIMIT 5
+    `).all(id, project, category, created_at, created_at, created_at) as Array<{ id: string }>;
+
+    for (const r of rowsC) {
+      const existing = this.stmtGetLink.get(id, r.id);
+      if (!existing) {
+        this.stmtLinkUpsert.run(id, r.id, "related", 0.4, 1);
+      }
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Fase 2: Multi-hop traversal
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Traverse the memory graph up to max_depth hops following outgoing links.
+   * Uses a recursive CTE with cycle detection via a path string.
+   * Returns all reachable memories across all hops, sorted by depth ascending.
+   */
+  getRelatedDeep(input: GetRelatedDeepInput): GetRelatedDeepResult {
+    const { id, max_depth = 3, relation, project, limit = 50 } = input;
+    const proj = project ?? this.defaultProject;
+    const depth = Math.min(5, Math.max(1, max_depth));
+
+    const relationFilter = relation ? "AND ml.relation = ?" : "";
+
+    const sql = `
+      WITH RECURSIVE traverse(to_id, relation, weight, auto_generated, depth, path) AS (
+        -- Anchor: direct outgoing links from the start node.
+        -- Path includes the start ID so cycle detection can block loops back to it.
+        SELECT ml.to_id,
+               ml.relation,
+               COALESCE(ml.weight, 1.0),
+               COALESCE(ml.auto_generated, 0),
+               1,
+               ',' || ml.from_id || ',' || ml.to_id || ','
+        FROM memory_links ml
+        WHERE ml.from_id = ?
+          ${relationFilter}
+
+        UNION ALL
+
+        -- Recursive: follow outgoing links from current frontier
+        SELECT ml.to_id,
+               ml.relation,
+               COALESCE(ml.weight, 1.0),
+               COALESCE(ml.auto_generated, 0),
+               t.depth + 1,
+               t.path || ml.to_id || ','
+        FROM memory_links ml
+        JOIN traverse t ON ml.from_id = t.to_id
+        WHERE t.depth < ?
+          AND t.path NOT LIKE '%,' || ml.to_id || ',%'
+          ${relationFilter}
+      )
+      SELECT m.*,
+             t2.relation,
+             t2.min_depth AS depth,
+             t2.weight,
+             t2.auto_generated
+      FROM (
+        SELECT to_id,
+               relation,
+               MIN(depth) AS min_depth,
+               weight,
+               auto_generated
+        FROM traverse
+        GROUP BY to_id
+      ) t2
+      JOIN memories m ON m.id = t2.to_id
+      WHERE m.project = ?
+      ORDER BY t2.min_depth ASC
+      LIMIT ?
+    `;
+
+    const baseParams: unknown[] = [id];
+    if (relation) baseParams.push(relation);
+    baseParams.push(depth);
+    if (relation) baseParams.push(relation);
+    baseParams.push(proj, limit);
+
+    const rows = this.db.prepare(sql).all(...baseParams) as DeepTraversalRow[];
+
+    const results: RelatedMemoryDeep[] = rows.map((row) => ({
+      memory: this.rowToMemory(row),
+      relation: row.relation as RelationType,
+      depth: row.depth,
+      weight: row.weight ?? 1.0,
+      auto_generated: Boolean(row.auto_generated),
+    }));
+
+    return { total: results.length, results };
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Fase 2: Link suggestions
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Suggest potential links without creating them.
+   * If `id` is provided, analyse that specific memory.
+   * Otherwise, analyse up to 5 orphan memories in the project.
+   */
+  suggestLinks(input: SuggestLinksInput): SuggestLinksResult {
+    const { id, project, limit = 20 } = input;
+    const proj = project ?? this.defaultProject;
+    const ALIVE = "(expires_at IS NULL OR expires_at > datetime('now'))";
+
+    // Determine which memories to analyse
+    let targets: Memory[];
+    if (id) {
+      const m = this.getById(id);
+      targets = m ? [m] : [];
+    } else {
+      // Orphan memories: no links in either direction
+      const rows = this.db.prepare(`
+        SELECT m.* FROM memories m
+        WHERE m.project = ? AND ${ALIVE}
+          AND NOT EXISTS (
+            SELECT 1 FROM memory_links
+            WHERE from_id = m.id OR to_id = m.id
+          )
+        ORDER BY m.created_at DESC
+        LIMIT 5
+      `).all(proj) as MemoryRow[];
+      targets = rows.map((r) => this.rowToMemory(r));
+    }
+
+    const suggestions: SuggestLink[] = [];
+    const seen = new Set<string>();
+
+    for (const memory of targets) {
+      // Existing link partners (skip re-suggesting them)
+      const existingIds = new Set<string>();
+      const existingLinks = this.db.prepare(
+        "SELECT to_id FROM memory_links WHERE from_id = ? UNION SELECT from_id FROM memory_links WHERE to_id = ?"
+      ).all(memory.id, memory.id) as Array<{ to_id?: string; from_id?: string }>;
+      for (const l of existingLinks) {
+        const partner = l.to_id ?? l.from_id;
+        if (partner) existingIds.add(partner);
+      }
+
+      // Strategy A: shared tags
+      if (memory.tags.length >= 1) {
+        const rowsA = this.db.prepare(`
+          SELECT m.id, m.content, m.category, m.tags, COUNT(*) AS shared_count
+          FROM memories m, json_each(m.tags) je
+          WHERE m.id != ? AND m.project = ? AND ${ALIVE}
+            AND je.value IN (SELECT value FROM json_each(?))
+          GROUP BY m.id
+          HAVING COUNT(*) >= 1
+          ORDER BY shared_count DESC
+          LIMIT 10
+        `).all(memory.id, proj, JSON.stringify(memory.tags)) as Array<{ id: string; content: string; category: string; tags: string; shared_count: number }>;
+
+        for (const r of rowsA) {
+          const key = `${memory.id}→${r.id}`;
+          if (!existingIds.has(r.id) && !seen.has(key)) {
+            seen.add(key);
+            const weight = Math.min(1.0, r.shared_count * 0.3);
+            suggestions.push({
+              from_id: memory.id,
+              to_id: r.id,
+              to_content_preview: r.content.slice(0, 80),
+              to_category: r.category,
+              to_tags: JSON.parse(r.tags) as string[],
+              suggested_relation: "related",
+              weight,
+              reason: "shared_tags" as SuggestLinkReason,
+            });
+          }
+        }
+      }
+
+      // Strategy B: FTS5 content similarity
+      const terms = memory.content.split(/\s+/).filter(Boolean).slice(0, 5);
+      if (terms.length >= 2) {
+        const ftsQuery = this.buildFtsQuery(terms.join(" "), "any");
+        if (ftsQuery) {
+          const rowsB = this.db.prepare(`
+            SELECT m.id, m.content, m.category, m.tags, ft.rank
+            FROM memories_fts ft JOIN memories m ON ft.rowid = m.rowid
+            WHERE memories_fts MATCH ? AND m.id != ? AND m.project = ? AND ${ALIVE}
+            ORDER BY ft.rank
+            LIMIT 5
+          `).all(ftsQuery, memory.id, proj) as Array<{ id: string; content: string; category: string; tags: string; rank: number }>;
+
+          for (const r of rowsB) {
+            if (r.rank < -0.5) {
+              const key = `${memory.id}→${r.id}`;
+              if (!existingIds.has(r.id) && !seen.has(key)) {
+                seen.add(key);
+                const weight = Math.min(0.9, Math.max(0.1, Math.abs(r.rank) / 10));
+                suggestions.push({
+                  from_id: memory.id,
+                  to_id: r.id,
+                  to_content_preview: r.content.slice(0, 80),
+                  to_category: r.category,
+                  to_tags: JSON.parse(r.tags) as string[],
+                  suggested_relation: "references",
+                  weight,
+                  reason: "content_similarity" as SuggestLinkReason,
+                });
+              }
+            }
+          }
+        }
+      }
+
+      // Strategy C: temporal proximity ± 1 h, same category
+      const rowsC = this.db.prepare(`
+        SELECT m.id, m.content, m.category, m.tags
+        FROM memories m
+        WHERE m.id != ? AND m.project = ? AND m.category = ?
+          AND m.created_at BETWEEN datetime(?, '-1 hour') AND datetime(?, '+1 hour')
+          AND ${ALIVE}
+        ORDER BY ABS(julianday(m.created_at) - julianday(?))
+        LIMIT 5
+      `).all(memory.id, proj, memory.category, memory.created_at, memory.created_at, memory.created_at) as Array<{ id: string; content: string; category: string; tags: string }>;
+
+      for (const r of rowsC) {
+        const key = `${memory.id}→${r.id}`;
+        if (!existingIds.has(r.id) && !seen.has(key)) {
+          seen.add(key);
+          suggestions.push({
+            from_id: memory.id,
+            to_id: r.id,
+            to_content_preview: r.content.slice(0, 80),
+            to_category: r.category,
+            to_tags: JSON.parse(r.tags) as string[],
+            suggested_relation: "related",
+            weight: 0.4,
+            reason: "temporal_proximity" as SuggestLinkReason,
+          });
+        }
+      }
+    }
+
+    return {
+      analysed: targets.length,
+      suggestions: suggestions.slice(0, limit),
+    };
   }
 
   close(): void {

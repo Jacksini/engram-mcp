@@ -10,9 +10,9 @@ describe("Relations (Ronda 25)", () => {
 
   beforeEach(() => {
     db = createTestDb();
-    idA = db.create({ content: "Memory A", category: "code" }).id;
-    idB = db.create({ content: "Memory B", category: "decision" }).id;
-    idC = db.create({ content: "Memory C", category: "general" }).id;
+    idA = db.create({ content: "Memory A", category: "code", auto_link: false }).id;
+    idB = db.create({ content: "Memory B", category: "decision", auto_link: false }).id;
+    idC = db.create({ content: "Memory C", category: "general", auto_link: false }).id;
   });
 
   afterEach(() => { db.close(); });

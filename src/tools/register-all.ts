@@ -28,6 +28,8 @@ import { registerGetHistory } from "./get-history.js";
 import { registerRestoreMemory } from "./restore-memory.js";
 import { registerListProjects } from "./list-projects.js";
 import { registerMigrateToProject } from "./migrate-to-project.js";
+import { registerGetRelatedDeep } from "./get-related-deep.js";
+import { registerSuggestLinks } from "./suggest-links.js";
 
 export function registerAllTools(server: McpServer, db: MemoryDatabase): void {
   registerSaveMemory(server, db);
@@ -58,4 +60,7 @@ export function registerAllTools(server: McpServer, db: MemoryDatabase): void {
   registerRestoreMemory(server, db);
   registerListProjects(server, db);
   registerMigrateToProject(server, db);
+  // Fase 2: Conexiones Inteligentes
+  registerGetRelatedDeep(server, db);
+  registerSuggestLinks(server, db);
 }

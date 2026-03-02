@@ -14,11 +14,13 @@ export function registerSaveMemories(server: McpServer, db: MemoryDatabase): voi
         .max(50, "No se pueden guardar más de 50 memorias a la vez")
         .describe("Lista de memorias a guardar"),
       project: ProjectParam,
+      auto_link: z.boolean().optional().default(true)
+        .describe("Si false, omite la inferencia automática de enlaces para todas las memorias del lote. Default: true."),
       ...CompactParams,
     },
-    async ({ memories, project, compact, content_preview_len }) => {
-      // Apply the tool-level project to each memory that doesn't specify its own
-      const inputs = memories.map((m) => ({ ...m, project: project }));
+    async ({ memories, project, auto_link, compact, content_preview_len }) => {
+      // Apply the tool-level project and auto_link to each memory that doesn't specify its own
+      const inputs = memories.map((m) => ({ ...m, project: project, auto_link }));
       const created = db.createBatch(inputs);
       const items = created.map(({ id, content, category: cat, tags, ...rest }) => {
         const truncated = content_preview_len != null ? content.slice(0, content_preview_len) : content;
