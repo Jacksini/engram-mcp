@@ -7,9 +7,11 @@
 
 A persistent memory server for AI agents, implemented as an [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server. Stores structured notes/memories in a local SQLite database with full-text search, tagging, categorisation, TTL expiration, directional graph relationships, and full change history.
 
+See [CHANGELOG.md](CHANGELOG.md) for recent implementation updates and release notes.
+
 ## Features
 
-- **32 MCP tools**  full CRUD, search, bulk ops, import/export, stats, tag utilities, graph relations, versioning
+- **30 MCP tools**  full CRUD, search, bulk ops, import/export, stats, tag utilities, graph relations, versioning
 - **CLI**  `engram-cli` for querying and managing memories from the terminal
 - **SQLite + FTS5**  fast full-text search with `any` / `all` / `near` modes
 - **Graph relations**  link memories with typed edges (`caused`, `references`, `supersedes`, `related`)
@@ -17,7 +19,7 @@ A persistent memory server for AI agents, implemented as an [MCP (Model Context 
 - **TTL**  optional `expires_at` on every memory; auto-purge on startup
 - **Rich filtering**  by category, tag, metadata key/value, date ranges, sort order
 - **ESLint + Prettier**  enforced code style
-- **455 tests**  full coverage via Vitest (`npm test`)
+- **492 tests**  full coverage via Vitest (`npm test`)
 
 ---
 
@@ -99,7 +101,7 @@ node build/cli.js <command> [options]
 ### CLI commands
 
 ```
-engram-cli [--db <path>] [--json] <command> [args] [options]
+engram-cli [--db <path>] [--project <name>] [--json] <command> [args] [options]
 
 COMMANDS
   search <query>              FTS search (--limit, --mode, --category, --tag)
@@ -113,8 +115,13 @@ COMMANDS
   link <from_id> <to_id>      Link two memories (--relation)
   unlink <from_id> <to_id>    Remove a link
   graph [--include-orphans]   Show memory graph (--relation, --mermaid-only)
+  get-related-deep <id>       Multi-hop graph traversal (--max-depth, --relation, --limit)
+  suggest-links [id]          Suggest possible links (--limit)
   history <id>                Change history for a memory (--limit)
   restore <id> <history_id>   Restore a memory to a previous version
+  list-projects               List projects with memory counts
+  migrate-to-project <tag> <project>
+                              Move memories with a specific tag to another project
   help                        Show help
 ```
 
@@ -123,6 +130,9 @@ COMMANDS
 ```bash
 # Search and show results as JSON
 engram-cli search "sqlite fts5" --limit 5 --json
+
+# Search within a specific project
+engram-cli --project engram-mcp search "wal checkpoint" --limit 5
 
 # List recent code memories
 engram-cli list --category code --limit 10
@@ -135,6 +145,14 @@ engram-cli get abc12345-...
 
 # Show the memory graph as Mermaid diagram
 engram-cli graph --mermaid-only
+
+# Multi-hop traversal and link suggestions
+engram-cli get-related-deep abc12345-... --max-depth 3 --limit 20
+engram-cli suggest-links abc12345-... --limit 10
+
+# Project utilities
+engram-cli list-projects
+engram-cli migrate-to-project engram-mcp engram-mcp
 
 # See history of a memory and restore a version
 engram-cli history abc12345-...
@@ -358,7 +376,7 @@ Every memory change (create, update, delete) is automatically recorded in the `m
 npm run build          # compile TypeScript  build/
 npm run build:watch    # watch mode
 npm run typecheck      # type-check only (no emit)
-npm test               # run all 455 tests
+npm test               # run all 492 tests
 npm run test:watch     # interactive watch mode
 npm run lint           # ESLint
 npm run lint:fix       # ESLint with auto-fix
@@ -375,7 +393,7 @@ src/
   db/
     database.ts         # MemoryDatabase class (all SQL logic)
     schema.ts           # SQLite DDL + triggers + migrations
-  tools/                # One file per MCP tool (32 total)
+  tools/                # One file per MCP tool (30 operativas + utilidades internas)
   types/
     memory.ts           # All TypeScript interfaces and types
 tests/
@@ -394,12 +412,16 @@ build/                  # Compiled output (git-ignored)
 | v1 | Added `expires_at` column + `idx_memories_expires_at` |
 | v2 | Added `memory_links` table + index |
 | v3 | Added `memory_history` table + index + triggers |
+| v4 | Added `project` scoping to memories/history + project indexes + trigger updates |
+| v5 | Added `weight` and `auto_generated` to `memory_links` + index |
+| v6 | Added `content_hash` expression index + metadata backfill |
 
 ### Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ENGRAM_DB_PATH` | `~/.engram/memories.db` | Path to the SQLite database file |
+| `ENGRAM_PROJECT` | `default` | Default project namespace when no `project` is provided |
 
 ---
 
