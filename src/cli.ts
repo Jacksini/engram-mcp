@@ -2,21 +2,22 @@
 /**
  * engram-cli — Command-line interface for engram-mcp
  *
- * Usage: engram-cli [--db <path>] [--json] <command> [args] [options]
+ * Usage: engram-cli [--db <path>] [--project <name>] [--json] <command> [args] [options]
  */
 
 import { MemoryDatabase } from "./db/database.js";
 import type { RelationType } from "./types/memory.js";
+import { pathToFileURL } from "node:url";
 
 // ─── Arg parser ──────────────────────────────────────────────────────────────
 
-interface ParsedArgs {
+export interface ParsedArgs {
   command: string;
   positional: string[];
   flags: Record<string, string | boolean>;
 }
 
-function parseArgs(argv: string[]): ParsedArgs {
+export function parseArgs(argv: string[]): ParsedArgs {
   const args = argv.slice(2); // remove node + script
   const flags: Record<string, string | boolean> = {};
   const positional: string[] = [];
@@ -115,15 +116,16 @@ function printHeader(): void {
 
 // ─── Help ─────────────────────────────────────────────────────────────────────
 
-function printHelp(): void {
-  console.log(`
+export function getHelpText(): string {
+  return `
 engram-cli — CLI para el servidor de memorias MCP
 
 USAGE
-  engram-cli [--db <path>] [--json] <command> [args] [options]
+  engram-cli [--db <path>] [--project <name>] [--json] <command> [args] [options]
 
 GLOBAL FLAGS
   --db <path>     Ruta al archivo de base de datos (default: ~/.engram/memories.db)
+  --project <p>   Proyecto/namesapce a usar (default: valor por defecto del servidor)
   --json          Salida en JSON (compatible para scripting)
 
 COMMANDS
@@ -171,13 +173,30 @@ COMMANDS
     --relation <rel>            Filtrar por tipo de relación
     --mermaid-only              Solo imprimir el diagrama Mermaid
 
+  get-related-deep <id>       Recorrer grafo por niveles desde un nodo
+    --max-depth <n>             Profundidad máxima (1-5, default: 3)
+    --relation <rel>            Filtrar por tipo de relación
+    --limit <n>                 Máximo de resultados (default: 50)
+
+  suggest-links [id]          Sugerir enlaces potenciales sin crearlos
+    --limit <n>                 Máximo de sugerencias (default: 20)
+
   history <id>                Historial de cambios de una memoria
     --limit <n>                 Límite (default: 20)
 
   restore <id> <history_id>   Restaurar memoria a versión anterior
 
+  list-projects               Listar proyectos y conteo de memorias
+
+  migrate-to-project <tag> <project>
+                              Mover memorias con el tag al proyecto destino
+
   help                        Mostrar esta ayuda
-`);
+`;
+}
+
+function printHelp(): void {
+  console.log(getHelpText());
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -187,6 +206,7 @@ const RELATION_TYPES = new Set(["caused", "references", "supersedes", "related"]
 async function main(): Promise<void> {
   const { command, positional, flags } = parseArgs(process.argv);
   const asJson = flags["json"] === true;
+  const project = typeof flags["project"] === "string" ? flags["project"] : undefined;
 
   const dbPath = typeof flags["db"] === "string" ? flags["db"] : undefined;
   const db = new MemoryDatabase(dbPath);
@@ -209,7 +229,7 @@ async function main(): Promise<void> {
         const category = typeof flags["category"] === "string" ? flags["category"] : undefined;
         const tag = typeof flags["tag"] === "string" ? flags["tag"] : undefined;
 
-        const result = db.searchWithTotal({ query, limit, offset: 0, mode, category, tag });
+        const result = db.searchWithTotal({ query, limit, offset: 0, mode, category, tag, project });
         if (asJson) { output(result); break; }
 
         console.log(`\n  Resultados: ${result.total} encontradas, mostrando ${result.memories.length}\n`);
@@ -229,7 +249,7 @@ async function main(): Promise<void> {
           ? (flags["sort"] as "created_at_desc" | "created_at_asc" | "updated_at_desc")
           : "created_at_desc";
 
-        const result = db.listWithTotal({ limit, offset, category, tag, sort_by });
+        const result = db.listWithTotal({ limit, offset, category, tag, sort_by, project });
         if (asJson) { output(result); break; }
 
         console.log(`\n  Total: ${result.total} | Mostrando ${offset + 1}–${offset + result.memories.length}\n`);
@@ -245,7 +265,10 @@ async function main(): Promise<void> {
         if (!id) { console.error("Error: se requiere un ID."); process.exit(1); }
 
         const memory = db.getById(id);
-        if (!memory) { console.error(`Error: memoria '${id}' no encontrada.`); process.exit(1); }
+        if (!memory || (project && memory.project !== project)) {
+          console.error(`Error: memoria '${id}' no encontrada${project ? ` en proyecto '${project}'` : ""}.`);
+          process.exit(1);
+        }
 
         if (asJson) { output(memory); break; }
         printMemoryFull(memory);
@@ -264,7 +287,7 @@ async function main(): Promise<void> {
         const metadata = JSON.parse(metaRaw) as Record<string, unknown>;
         const expires_at = typeof flags["expires"] === "string" ? flags["expires"] : undefined;
 
-        const saved = db.create({ content, category, tags, metadata, expires_at });
+        const saved = db.create({ content, category, tags, metadata, expires_at, project });
         if (asJson) { output(saved); break; }
 
         console.log(`\n  ✓ Memoria guardada\n`);
@@ -278,7 +301,10 @@ async function main(): Promise<void> {
         if (!id) { console.error("Error: se requiere un ID."); process.exit(1); }
 
         const current = db.getById(id);
-        if (!current) { console.error(`Error: memoria '${id}' no encontrada.`); process.exit(1); }
+        if (!current || (project && current.project !== project)) {
+          console.error(`Error: memoria '${id}' no encontrada${project ? ` en proyecto '${project}'` : ""}.`);
+          process.exit(1);
+        }
 
         const content = typeof flags["content"] === "string" ? flags["content"] : undefined;
         const category = typeof flags["category"] === "string" ? flags["category"] : undefined;
@@ -307,7 +333,10 @@ async function main(): Promise<void> {
         if (!id) { console.error("Error: se requiere un ID."); process.exit(1); }
 
         const memory = db.getById(id);
-        if (!memory) { console.error(`Error: memoria '${id}' no encontrada.`); process.exit(1); }
+        if (!memory || (project && memory.project !== project)) {
+          console.error(`Error: memoria '${id}' no encontrada${project ? ` en proyecto '${project}'` : ""}.`);
+          process.exit(1);
+        }
 
         if (!flags["yes"]) {
           console.log(`\n  Memoria a eliminar: ${id}`);
@@ -324,7 +353,7 @@ async function main(): Promise<void> {
 
       // ── stats ─────────────────────────────────────────────────────────────
       case "stats": {
-        const stats = db.getStats();
+        const stats = db.getStats(project);
         if (asJson) { output(stats); break; }
 
         console.log(`\n  ── Estadísticas ─────────────────────────────`);
@@ -379,7 +408,7 @@ async function main(): Promise<void> {
           ? (flags["relation"] as RelationType)
           : "related";
 
-        const link = db.linkMemories({ from_id: fromId, to_id: toId, relation });
+        const link = db.linkMemories({ from_id: fromId, to_id: toId, relation, project });
         if (asJson) { output(link); break; }
         console.log(`\n  ✓ Enlace creado: ${fromId.slice(0, 8)} --${relation}--> ${toId.slice(0, 8)}\n`);
         break;
@@ -406,7 +435,7 @@ async function main(): Promise<void> {
           : undefined;
         const mermaidOnly = flags["mermaid-only"] === true;
 
-        const result = db.getGraph({ include_orphans, relation });
+        const result = db.getGraph({ include_orphans, relation, project });
         if (asJson) { output(result); break; }
 
         if (mermaidOnly) {
@@ -427,13 +456,61 @@ async function main(): Promise<void> {
         break;
       }
 
+      // ── get-related-deep ────────────────────────────────────────────────
+      case "get-related-deep": {
+        const id = positional[0];
+        if (!id) { console.error("Error: se requiere un ID de origen."); process.exit(1); }
+
+        const max_depth = flags["max-depth"] ? parseInt(str(flags["max-depth"]), 10) : 3;
+        const relation = (typeof flags["relation"] === "string" && RELATION_TYPES.has(flags["relation"]))
+          ? (flags["relation"] as RelationType)
+          : undefined;
+        const limit = flags["limit"] ? parseInt(str(flags["limit"]), 10) : 50;
+
+        const result = db.getRelatedDeep({ id, max_depth, relation, project, limit });
+        if (asJson) { output(result); break; }
+
+        console.log(`\n  Reachables: ${result.total}\n`);
+        result.results.forEach((row) => {
+          console.log(
+            `  d${row.depth} ${row.memory.id.slice(0, 8)}  [${row.relation}]  ${truncate(row.memory.content, 60)}`
+          );
+        });
+        console.log();
+        break;
+      }
+
+      // ── suggest-links ───────────────────────────────────────────────────
+      case "suggest-links": {
+        const id = positional[0];
+        const limit = flags["limit"] ? parseInt(str(flags["limit"]), 10) : 20;
+
+        const result = db.suggestLinks({ id, project, limit });
+        if (asJson) { output(result); break; }
+
+        console.log(`\n  Analizadas: ${result.analysed} | Sugerencias: ${result.suggestions.length}\n`);
+        result.suggestions.forEach((s) => {
+          console.log(
+            `  ${s.from_id.slice(0, 8)} -> ${s.to_id.slice(0, 8)}  [${s.suggested_relation}]  w=${s.weight.toFixed(2)}  ${s.reason}`
+          );
+        });
+        console.log();
+        break;
+      }
+
       // ── history ───────────────────────────────────────────────────────────
       case "history": {
         const id = positional[0];
         if (!id) { console.error("Error: se requiere un ID."); process.exit(1); }
 
         const limit = flags["limit"] ? parseInt(str(flags["limit"]), 10) : 20;
-        const result = db.getHistory({ memory_id: id, limit, offset: 0 });
+        const memory = db.getById(id);
+        if (!memory || (project && memory.project !== project)) {
+          console.error(`Error: memoria '${id}' no encontrada${project ? ` en proyecto '${project}'` : ""}.`);
+          process.exit(1);
+        }
+
+        const result = db.getHistory({ memory_id: id, project, limit, offset: 0 });
 
         if (asJson) { output(result); break; }
 
@@ -458,15 +535,57 @@ async function main(): Promise<void> {
           process.exit(1);
         }
 
+        const memory = db.getById(id);
+        if (!memory || (project && memory.project !== project)) {
+          console.error(`Error: memoria '${id}' no encontrada${project ? ` en proyecto '${project}'` : ""}.`);
+          process.exit(1);
+        }
+
         const restored = db.restoreMemory({ memory_id: id, history_id: parseInt(histId, 10) });
         if (!restored) {
           console.error(`Error: no se encontró la memoria o la entrada de historial.`);
           process.exit(1);
         }
 
+        if (project && restored.project !== project) {
+          console.error(`Error: no se pudo restaurar la memoria en el proyecto '${project}'.`);
+          process.exit(1);
+        }
+
         if (asJson) { output(restored); break; }
         console.log(`\n  ✓ Memoria restaurada al estado #${histId}\n`);
         printMemoryFull(restored);
+        break;
+      }
+
+      // ── list-projects ───────────────────────────────────────────────────
+      case "list-projects": {
+        const projects = db.listProjects();
+        if (asJson) { output({ projects, default_project: db.defaultProject }); break; }
+
+        console.log(`\n  Proyectos (${projects.length})\n`);
+        projects.forEach((p) => {
+          const mark = p.project === db.defaultProject ? "*" : " ";
+          console.log(`  ${mark} ${pad(p.project, 20)} ${p.count}`);
+        });
+        console.log("\n  * proyecto por defecto\n");
+        break;
+      }
+
+      // ── migrate-to-project ──────────────────────────────────────────────
+      case "migrate-to-project": {
+        const tag = positional[0];
+        const targetProject = positional[1];
+        if (!tag || !targetProject) {
+          console.error("Error: se requieren <tag> y <project>.");
+          process.exit(1);
+        }
+
+        const migrated = db.migrateToProject({ tag, project: targetProject });
+        const payload = { migrated, tag, project: targetProject };
+        if (asJson) { output(payload); break; }
+
+        console.log(`\n  ✓ Migradas ${migrated} memorias con tag '${tag}' al proyecto '${targetProject}'\n`);
         break;
       }
 
@@ -482,7 +601,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err: Error) => {
-  console.error("Error:", err.message);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err: Error) => {
+    console.error("Error:", err.message);
+    process.exit(1);
+  });
+}
