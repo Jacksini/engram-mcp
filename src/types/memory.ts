@@ -213,6 +213,8 @@ export interface LinkMemoriesInput {
   from_id: string;
   to_id: string;
   relation?: RelationType;
+  /** Project namespace used to validate link isolation. When omitted, uses default project. */
+  project?: string;
   /** Link strength 0.0–1.0. Defaults to 1.0 for manual links. */
   weight?: number;
   /** Internal flag. Set to 1 only by the auto-link engine. */
@@ -282,6 +284,8 @@ export interface SuggestLinksResult {
 export interface GetRelatedInput {
   id: string;
   relation?: RelationType;
+  /** Project namespace to scope related results. When omitted, uses the server's default project. */
+  project?: string;
   /** "from" = outgoing links, "to" = incoming links, "both" = all */
   direction?: "from" | "to" | "both";
 }
@@ -304,6 +308,8 @@ export interface ListLinksInput {
   from_id?: string;
   to_id?: string;
   relation?: RelationType;
+  /** Project namespace to scope links. When omitted, uses the server's default project. */
+  project?: string;
   limit?: number;
   offset?: number;
 }

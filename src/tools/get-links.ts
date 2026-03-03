@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { MemoryDatabase } from "../db/database.js";
+import { ProjectParam } from "./schemas.js";
 
 const RELATION_TYPES = ["caused", "references", "supersedes", "related"] as const;
 
@@ -24,6 +25,7 @@ export function registerGetLinks(server: McpServer, db: MemoryDatabase): void {
         .enum(RELATION_TYPES)
         .optional()
         .describe("Filtrar por tipo de relación: caused | references | supersedes | related."),
+      project: ProjectParam,
       limit: z
         .number()
         .int()
@@ -38,8 +40,8 @@ export function registerGetLinks(server: McpServer, db: MemoryDatabase): void {
         .optional()
         .describe("Offset para paginación (>= 0)."),
     },
-    async ({ from_id, to_id, relation, limit, offset }) => {
-      const result = db.listLinks({ from_id, to_id, relation, limit, offset });
+    async ({ from_id, to_id, relation, project, limit, offset }) => {
+      const result = db.listLinks({ from_id, to_id, relation, project, limit, offset });
       return {
         content: [
           {

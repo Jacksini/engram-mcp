@@ -200,4 +200,30 @@ describe("get_related tool (getRelated)", () => {
       expect(r[0]!.relation).toBe("supersedes");
     });
   });
+
+  describe("project scoping", () => {
+    it("returns empty when the source memory is outside the requested project", () => {
+      const p2a = db.create({ content: "P2 A", project: "p2", auto_link: false }).id;
+      const p2b = db.create({ content: "P2 B", project: "p2", auto_link: false }).id;
+      db.linkMemories({ from_id: p2a, to_id: p2b, relation: "related", project: "p2" });
+
+      const result = db.getRelated({ id: p2a, project: "default", direction: "from" });
+      expect(result).toHaveLength(0);
+    });
+
+    it("returns only links within the requested project", () => {
+      const p2a = db.create({ content: "P2 A", project: "p2", auto_link: false }).id;
+      const p2b = db.create({ content: "P2 B", project: "p2", auto_link: false }).id;
+      db.linkMemories({ from_id: idA, to_id: idB, relation: "related" });
+      db.linkMemories({ from_id: p2a, to_id: p2b, relation: "related", project: "p2" });
+
+      const defaultResults = db.getRelated({ id: idA, project: "default", direction: "from" });
+      expect(defaultResults).toHaveLength(1);
+      expect(defaultResults[0]!.memory.id).toBe(idB);
+
+      const p2Results = db.getRelated({ id: p2a, project: "p2", direction: "from" });
+      expect(p2Results).toHaveLength(1);
+      expect(p2Results[0]!.memory.id).toBe(p2b);
+    });
+  });
 });

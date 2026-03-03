@@ -970,7 +970,18 @@ export class MemoryDatabase {
    * is replaced with the new value.
    */
   linkMemories(input: LinkMemoriesInput): MemoryLink {
-    const { from_id, to_id, relation = "related", weight = 1.0, auto_generated = 0 } = input;
+    const { from_id, to_id, relation = "related", project, weight = 1.0, auto_generated = 0 } = input;
+    const proj = project ?? this.defaultProject;
+    const fromMemory = this.getById(from_id);
+    const toMemory = this.getById(to_id);
+
+    if (!fromMemory || !toMemory) {
+      throw new Error("Both memories must exist before creating a link.");
+    }
+    if (fromMemory.project !== proj || toMemory.project !== proj || fromMemory.project !== toMemory.project) {
+      throw new Error("Cross-project links are not allowed.");
+    }
+
     const row = this.stmtLinkUpsert.get(from_id, to_id, relation, weight, auto_generated) as MemoryLink;
     return row;
   }
@@ -1010,12 +1021,36 @@ export class MemoryDatabase {
    * Optionally filtered by relation type.
    */
   getRelated(input: GetRelatedInput): RelatedMemory[] {
-    const { id, relation, direction = "both" } = input;
+    const { id, relation, project, direction = "both" } = input;
+    const proj = project ?? this.defaultProject;
     const results: RelatedMemory[] = [];
 
+    const source = this.getById(id);
+    if (!source || source.project !== proj) {
+      return [];
+    }
+
+    const baseFrom = `
+      SELECT m.*, l.relation, l.created_at AS link_created_at, l.weight, l.auto_generated
+      FROM memory_links l
+      JOIN memories m ON l.to_id = m.id
+      WHERE l.from_id = ? AND m.project = ?
+    `;
+    const baseTo = `
+      SELECT m.*, l.relation, l.created_at AS link_created_at, l.weight, l.auto_generated
+      FROM memory_links l
+      JOIN memories m ON l.from_id = m.id
+      WHERE l.to_id = ? AND m.project = ?
+    `;
+
     if (direction === "from" || direction === "both") {
-      const stmt = relation ? this.stmtLinksFromRel : this.stmtLinksFrom;
-      const params: unknown[] = relation ? [id, relation] : [id];
+      const stmt = this.getOrPrepare(
+        relation ? "related_from_project_rel" : "related_from_project",
+        relation
+          ? `${baseFrom} AND l.relation = ? ORDER BY l.created_at DESC`
+          : `${baseFrom} ORDER BY l.created_at DESC`
+      );
+      const params: unknown[] = relation ? [id, proj, relation] : [id, proj];
       const rows = stmt.all(...params) as LinkQueryRow[];
       for (const row of rows) {
         results.push({
@@ -1030,8 +1065,13 @@ export class MemoryDatabase {
     }
 
     if (direction === "to" || direction === "both") {
-      const stmt = relation ? this.stmtLinksToRel : this.stmtLinksTo;
-      const params: unknown[] = relation ? [id, relation] : [id];
+      const stmt = this.getOrPrepare(
+        relation ? "related_to_project_rel" : "related_to_project",
+        relation
+          ? `${baseTo} AND l.relation = ? ORDER BY l.created_at DESC`
+          : `${baseTo} ORDER BY l.created_at DESC`
+      );
+      const params: unknown[] = relation ? [id, proj, relation] : [id, proj];
       const rows = stmt.all(...params) as LinkQueryRow[];
       for (const row of rows) {
         results.push({
@@ -1158,7 +1198,12 @@ export class MemoryDatabase {
                1,
                ',' || ml.from_id || ',' || ml.to_id || ','
         FROM memory_links ml
+        JOIN memories m_from ON ml.from_id = m_from.id
+        JOIN memories m_to ON ml.to_id = m_to.id
         WHERE ml.from_id = ?
+          AND m_from.project = ?
+          AND m_to.project = ?
+          AND (m_to.expires_at IS NULL OR m_to.expires_at > datetime('now'))
           ${relationFilter}
 
         UNION ALL
@@ -1172,7 +1217,12 @@ export class MemoryDatabase {
                t.path || ml.to_id || ','
         FROM memory_links ml
         JOIN traverse t ON ml.from_id = t.to_id
+        JOIN memories m_from ON ml.from_id = m_from.id
+        JOIN memories m_to ON ml.to_id = m_to.id
         WHERE t.depth < ?
+          AND m_from.project = ?
+          AND m_to.project = ?
+          AND (m_to.expires_at IS NULL OR m_to.expires_at > datetime('now'))
           AND t.path NOT LIKE '%,' || ml.to_id || ',%'
           ${relationFilter}
       )
@@ -1192,13 +1242,15 @@ export class MemoryDatabase {
       ) t2
       JOIN memories m ON m.id = t2.to_id
       WHERE m.project = ?
+        AND (m.expires_at IS NULL OR m.expires_at > datetime('now'))
       ORDER BY t2.min_depth ASC
       LIMIT ?
     `;
 
-    const baseParams: unknown[] = [id];
+    const baseParams: unknown[] = [id, proj, proj];
     if (relation) baseParams.push(relation);
     baseParams.push(depth);
+    baseParams.push(proj, proj);
     if (relation) baseParams.push(relation);
     baseParams.push(proj, limit);
 
@@ -1406,24 +1458,31 @@ export class MemoryDatabase {
    * Supports filtering by from_id, to_id and/or relation type, plus pagination.
    */
   listLinks(input: ListLinksInput): ListLinksResult {
-    const { from_id, to_id, relation, limit = 50, offset = 0 } = input;
+    const { from_id, to_id, relation, project, limit = 50, offset = 0 } = input;
+    const proj = project ?? this.defaultProject;
 
     const conditions: string[] = [];
-    const params: unknown[] = [];
+    const params: unknown[] = [proj, proj];
 
-    if (from_id)  { conditions.push("from_id = ?");  params.push(from_id); }
-    if (to_id)    { conditions.push("to_id = ?");    params.push(to_id); }
-    if (relation) { conditions.push("relation = ?"); params.push(relation); }
+    if (from_id)  { conditions.push("l.from_id = ?");  params.push(from_id); }
+    if (to_id)    { conditions.push("l.to_id = ?");    params.push(to_id); }
+    if (relation) { conditions.push("l.relation = ?"); params.push(relation); }
 
-    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const whereExtra = conditions.length > 0 ? ` AND ${conditions.join(" AND ")}` : "";
+    const baseFrom = `
+      FROM memory_links l
+      JOIN memories m1 ON l.from_id = m1.id
+      JOIN memories m2 ON l.to_id = m2.id
+      WHERE m1.project = ? AND m2.project = ?${whereExtra}
+    `;
 
     const countRow = this.db.prepare(
-      `SELECT COUNT(*) AS cnt FROM memory_links ${where}`
+      `SELECT COUNT(*) AS cnt ${baseFrom}`
     ).get(...params) as { cnt: number };
 
     const linkParams = [...params, limit, offset];
     const rows = this.db.prepare(
-      `SELECT * FROM memory_links ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+      `SELECT l.* ${baseFrom} ORDER BY l.created_at DESC LIMIT ? OFFSET ?`
     ).all(...linkParams) as MemoryLink[];
 
     return { total: countRow.cnt, offset, limit, links: rows };

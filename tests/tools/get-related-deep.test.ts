@@ -111,4 +111,30 @@ describe("getRelatedDeep() — Fase 2 Multi-hop Traversal", () => {
     const result = db.getRelatedDeep({ id: idA, max_depth: 5, limit: 2 });
     expect(result.results.length).toBeLessThanOrEqual(2);
   });
+
+  it("scopes traversal by project", () => {
+    const p2a = db.create({ content: "P2 root", project: "p2", auto_link: false }).id;
+    const p2b = db.create({ content: "P2 child", project: "p2", auto_link: false }).id;
+    db.linkMemories({ from_id: p2a, to_id: p2b, relation: "related", project: "p2" });
+
+    const defaultScope = db.getRelatedDeep({ id: p2a, max_depth: 2, project: "default" });
+    expect(defaultScope.total).toBe(0);
+
+    const p2Scope = db.getRelatedDeep({ id: p2a, max_depth: 2, project: "p2" });
+    expect(p2Scope.total).toBe(1);
+    expect(p2Scope.results[0]!.memory.id).toBe(p2b);
+  });
+
+  it("excludes expired nodes from traversal results", () => {
+    const expired = db.create({
+      content: "Expired node",
+      auto_link: false,
+      expires_at: "2000-01-01T00:00:00Z",
+    }).id;
+    db.linkMemories({ from_id: idA, to_id: expired, relation: "related" });
+
+    const result = db.getRelatedDeep({ id: idA, max_depth: 2 });
+    const ids = result.results.map(r => r.memory.id);
+    expect(ids).not.toContain(expired);
+  });
 });

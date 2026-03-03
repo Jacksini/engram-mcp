@@ -177,4 +177,27 @@ describe("get_links tool (listLinks)", () => {
       expect(result.total).toBe(0);
     });
   });
+
+  describe("project scoping", () => {
+    it("defaults to defaultProject scope", () => {
+      const p2a = db.create({ content: "P2 A", project: "p2", auto_link: false }).id;
+      const p2b = db.create({ content: "P2 B", project: "p2", auto_link: false }).id;
+      db.linkMemories({ from_id: p2a, to_id: p2b, relation: "related", project: "p2" });
+
+      const result = db.listLinks({});
+      expect(result.total).toBe(4);
+      expect(result.links.some(l => l.from_id === p2a || l.to_id === p2b)).toBe(false);
+    });
+
+    it("returns only links in the selected project", () => {
+      const p2a = db.create({ content: "P2 A", project: "p2", auto_link: false }).id;
+      const p2b = db.create({ content: "P2 B", project: "p2", auto_link: false }).id;
+      db.linkMemories({ from_id: p2a, to_id: p2b, relation: "caused", project: "p2" });
+
+      const result = db.listLinks({ project: "p2" });
+      expect(result.total).toBe(1);
+      expect(result.links[0]!.from_id).toBe(p2a);
+      expect(result.links[0]!.to_id).toBe(p2b);
+    });
+  });
 });

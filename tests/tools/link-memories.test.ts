@@ -59,6 +59,15 @@ describe("Relations (Ronda 25)", () => {
       expect(ab.relation).toBe("caused");
       expect(ba.relation).toBe("references");
     });
+
+    it("rejects cross-project links", () => {
+      const other = db.create({ content: "Other project node", project: "other", auto_link: false }).id;
+      expect(() => db.linkMemories({ from_id: idA, to_id: other })).toThrow("Cross-project links are not allowed.");
+    });
+
+    it("rejects links when explicit project doesn't match memory project", () => {
+      expect(() => db.linkMemories({ from_id: idA, to_id: idB, project: "other" })).toThrow("Cross-project links are not allowed.");
+    });
   });
 
   // ─── unlinkMemories ────────────────────────────────────────────────────────
