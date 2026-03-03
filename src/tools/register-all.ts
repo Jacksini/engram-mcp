@@ -30,37 +30,52 @@ import { registerListProjects } from "./list-projects.js";
 import { registerMigrateToProject } from "./migrate-to-project.js";
 import { registerGetRelatedDeep } from "./get-related-deep.js";
 import { registerSuggestLinks } from "./suggest-links.js";
+import { registerListToolGroups } from "./list-tool-groups.js";
+import { patchGroupedToolDescriptions } from "./grouped-descriptions.js";
 
 export function registerAllTools(server: McpServer, db: MemoryDatabase): void {
+  patchGroupedToolDescriptions(server);
+
+  // Create
   registerSaveMemory(server, db);
   registerSaveMemories(server, db);
+
+  // Read
   registerGetMemory(server, db);
   registerGetMemories(server, db);
+  registerListMemories(server, db);
+  registerSearchMemories(server, db);
+  registerGetContextSnapshot(server, db);
+  registerExportMemories(server, db);
+  registerGetStats(server, db);
+  registerGetHistory(server, db);
+  registerListProjects(server, db);
+
+  // Update
   registerUpdateMemory(server, db);
   registerUpdateMemories(server, db);
+  registerRestoreMemory(server, db);
+  registerRenameTag(server, db);
+  registerUpdateLink(server, db);
+  registerMigrateToProject(server, db);
+
+  // Delete
   registerDeleteMemory(server, db);
   registerDeleteMemories(server, db);
-  registerSearchMemories(server, db);
-  registerListMemories(server, db);
-  registerGetContextSnapshot(server, db);
-  registerMaintenance(server, db);
-  registerExportMemories(server, db);
-  registerImportMemories(server, db);
-  registerGetStats(server, db);
   registerPurgeExpired(server, db);
+
+  // Graph
   registerLinkMemories(server, db);
   registerUnlinkMemories(server, db);
   registerGetRelated(server, db);
-  registerRenameTag(server, db);
   registerGetLinks(server, db);
-  registerUpdateLink(server, db);
-  registerBackup(server, db);
   registerGetGraph(server, db);
-  registerGetHistory(server, db);
-  registerRestoreMemory(server, db);
-  registerListProjects(server, db);
-  registerMigrateToProject(server, db);
-  // Fase 2: Conexiones Inteligentes
   registerGetRelatedDeep(server, db);
   registerSuggestLinks(server, db);
+
+  // Ops/Admin
+  registerImportMemories(server, db);
+  registerMaintenance(server, db);
+  registerBackup(server, db);
+  registerListToolGroups(server, db);
 }

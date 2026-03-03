@@ -11,7 +11,9 @@ See [CHANGELOG.md](CHANGELOG.md) for recent implementation updates and release n
 
 ## Features
 
-- **30 MCP tools**  full CRUD, search, bulk ops, import/export, stats, tag utilities, graph relations, versioning
+- **31 MCP tools**  full CRUD, search, bulk ops, import/export, stats, tag utilities, graph relations, versioning
+- **Grouped discovery**  `list_tool_groups` helps understand each tool’s primary function block
+- **Clear MCP UX**  tool descriptions are automatically prefixed by function group (`Create ·`, `Read ·`, `Update ·`, `Delete ·`, `Graph ·`, `Ops/Admin ·`)
 - **CLI**  `engram-cli` for querying and managing memories from the terminal
 - **SQLite + FTS5**  fast full-text search with `any` / `all` / `near` modes
 - **Graph relations**  link memories with typed edges (`caused`, `references`, `supersedes`, `related`)
@@ -162,6 +164,19 @@ engram-cli restore abc12345-... 42
 ---
 
 ## MCP Tools reference
+
+### Tool map by group
+
+| Group | Tools |
+|------|-------|
+| `Create` | `save_memory`, `save_memories` |
+| `Read` | `get_memory`, `get_memories`, `list_memories`, `search_memories`, `get_context_snapshot`, `get_stats`, `export_memories`, `get_history`, `list_projects` |
+| `Update` | `update_memory`, `update_memories`, `restore_memory`, `rename_tag`, `update_link`, `migrate_to_project` |
+| `Delete` | `delete_memory`, `delete_memories`, `purge_expired` |
+| `Graph` | `link_memories`, `unlink_memories`, `get_related`, `get_links`, `get_graph`, `get_related_deep`, `suggest_links` |
+| `Ops/Admin` | `import_memories`, `maintenance`, `backup`, `list_tool_groups` |
+
+> Tip: use `list_tool_groups` from your MCP client to get this grouping as structured JSON.
 
 ### Create
 
@@ -344,6 +359,7 @@ Every memory change (create, update, delete) is automatically recorded in the `m
 | `purge_expired` | Delete all memories with a past `expires_at`. Returns `{purged, ids}` |
 | `db_maintenance` | SQLite `integrity_check` + WAL checkpoint |
 | `backup` | Copy the database to `memories.backup.YYYY-MM-DDTHH-MM-SS.db` in the same directory |
+| `list_tool_groups` | List all MCP tools grouped by main function (Create/Read/Update/Delete/Graph/Ops) |
 
 > **Auto-purge:** expired memories are removed automatically on every server startup.
 
@@ -376,7 +392,7 @@ Every memory change (create, update, delete) is automatically recorded in the `m
 npm run build          # compile TypeScript  build/
 npm run build:watch    # watch mode
 npm run typecheck      # type-check only (no emit)
-npm test               # run all 492 tests
+npm test               # run all 493 tests
 npm run test:watch     # interactive watch mode
 npm run lint           # ESLint
 npm run lint:fix       # ESLint with auto-fix
@@ -393,7 +409,7 @@ src/
   db/
     database.ts         # MemoryDatabase class (all SQL logic)
     schema.ts           # SQLite DDL + triggers + migrations
-  tools/                # One file per MCP tool (30 operativas + utilidades internas)
+  tools/                # One file per MCP tool (31 operativas + utilidades internas)
   types/
     memory.ts           # All TypeScript interfaces and types
 tests/
