@@ -62,6 +62,45 @@ function str(val: unknown): string {
   return typeof val === "string" ? val : JSON.stringify(val);
 }
 
+function die(message: string): never {
+  console.error(`Error: ${message}`);
+  process.exit(1);
+}
+
+function getStringFlag(flags: Record<string, string | boolean>, key: string): string | undefined {
+  return typeof flags[key] === "string" ? flags[key] : undefined;
+}
+
+function getIntFlag(
+  flags: Record<string, string | boolean>,
+  key: string,
+  defaultValue: number,
+  label: string
+): number {
+  const raw = getStringFlag(flags, key);
+  if (raw === undefined) return defaultValue;
+
+  const parsed = parseInt(raw, 10);
+  if (Number.isNaN(parsed)) {
+    die(`${label} debe ser un número entero válido.`);
+  }
+  return parsed;
+}
+
+function parseCsv(raw?: string): string[] | undefined {
+  if (raw === undefined) return undefined;
+  return raw.split(",").map((t) => t.trim()).filter(Boolean);
+}
+
+function parseJsonObject(raw: string | undefined, fallback: Record<string, unknown>): Record<string, unknown> {
+  if (raw === undefined) return fallback;
+  try {
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    die("--metadata debe ser un JSON válido.");
+  }
+}
+
 function pad(s: string, n: number): string {
   return s.length >= n ? s.slice(0, n) : s + " ".repeat(n - s.length);
 }
@@ -222,12 +261,12 @@ async function main(): Promise<void> {
       // ── search ────────────────────────────────────────────────────────────
       case "search": {
         const query = positional[0];
-        if (!query) { console.error("Error: se requiere un término de búsqueda."); process.exit(1); }
+        if (!query) die("se requiere un término de búsqueda.");
 
-        const limit = flags["limit"] ? parseInt(str(flags["limit"]), 10) : 10;
+        const limit = getIntFlag(flags, "limit", 10, "--limit");
         const mode = (flags["mode"] as "any" | "all" | "near" | undefined) ?? "any";
-        const category = typeof flags["category"] === "string" ? flags["category"] : undefined;
-        const tag = typeof flags["tag"] === "string" ? flags["tag"] : undefined;
+        const category = getStringFlag(flags, "category");
+        const tag = getStringFlag(flags, "tag");
 
         const result = db.searchWithTotal({ query, limit, offset: 0, mode, category, tag, project });
         if (asJson) { output(result); break; }
@@ -241,12 +280,13 @@ async function main(): Promise<void> {
 
       // ── list ──────────────────────────────────────────────────────────────
       case "list": {
-        const limit = flags["limit"] ? parseInt(str(flags["limit"]), 10) : 20;
-        const offset = flags["offset"] ? parseInt(str(flags["offset"]), 10) : 0;
-        const category = typeof flags["category"] === "string" ? flags["category"] : undefined;
-        const tag = typeof flags["tag"] === "string" ? flags["tag"] : undefined;
-        const sort_by = typeof flags["sort"] === "string"
-          ? (flags["sort"] as "created_at_desc" | "created_at_asc" | "updated_at_desc")
+        const limit = getIntFlag(flags, "limit", 20, "--limit");
+        const offset = getIntFlag(flags, "offset", 0, "--offset");
+        const category = getStringFlag(flags, "category");
+        const tag = getStringFlag(flags, "tag");
+        const sort = getStringFlag(flags, "sort");
+        const sort_by = sort
+          ? (sort as "created_at_desc" | "created_at_asc" | "updated_at_desc")
           : "created_at_desc";
 
         const result = db.listWithTotal({ limit, offset, category, tag, sort_by, project });
@@ -262,12 +302,11 @@ async function main(): Promise<void> {
       // ── get ───────────────────────────────────────────────────────────────
       case "get": {
         const id = positional[0];
-        if (!id) { console.error("Error: se requiere un ID."); process.exit(1); }
+        if (!id) die("se requiere un ID.");
 
         const memory = db.getById(id);
         if (!memory || (project && memory.project !== project)) {
-          console.error(`Error: memoria '${id}' no encontrada${project ? ` en proyecto '${project}'` : ""}.`);
-          process.exit(1);
+          die(`memoria '${id}' no encontrada${project ? ` en proyecto '${project}'` : ""}.`);
         }
 
         if (asJson) { output(memory); break; }
@@ -278,14 +317,12 @@ async function main(): Promise<void> {
       // ── save ──────────────────────────────────────────────────────────────
       case "save": {
         const content = positional[0];
-        if (!content) { console.error("Error: se requiere contenido."); process.exit(1); }
+        if (!content) die("se requiere contenido.");
 
-        const category = typeof flags["category"] === "string" ? flags["category"] : "general";
-        const tagsRaw = typeof flags["tags"] === "string" ? flags["tags"] : "";
-        const tags = tagsRaw ? tagsRaw.split(",").map((t) => t.trim()).filter(Boolean) : [];
-        const metaRaw = typeof flags["metadata"] === "string" ? flags["metadata"] : "{}";
-        const metadata = JSON.parse(metaRaw) as Record<string, unknown>;
-        const expires_at = typeof flags["expires"] === "string" ? flags["expires"] : undefined;
+        const category = getStringFlag(flags, "category") ?? "general";
+        const tags = parseCsv(getStringFlag(flags, "tags")) ?? [];
+        const metadata = parseJsonObject(getStringFlag(flags, "metadata"), {});
+        const expires_at = getStringFlag(flags, "expires");
 
         const saved = db.create({ content, category, tags, metadata, expires_at, project });
         if (asJson) { output(saved); break; }
@@ -298,28 +335,25 @@ async function main(): Promise<void> {
       // ── update ────────────────────────────────────────────────────────────
       case "update": {
         const id = positional[0];
-        if (!id) { console.error("Error: se requiere un ID."); process.exit(1); }
+        if (!id) die("se requiere un ID.");
 
         const current = db.getById(id);
         if (!current || (project && current.project !== project)) {
-          console.error(`Error: memoria '${id}' no encontrada${project ? ` en proyecto '${project}'` : ""}.`);
-          process.exit(1);
+          die(`memoria '${id}' no encontrada${project ? ` en proyecto '${project}'` : ""}.`);
         }
 
-        const content = typeof flags["content"] === "string" ? flags["content"] : undefined;
-        const category = typeof flags["category"] === "string" ? flags["category"] : undefined;
-        const tagsRaw = typeof flags["tags"] === "string" ? flags["tags"] : undefined;
-        const tags = tagsRaw ? tagsRaw.split(",").map((t) => t.trim()).filter(Boolean) : undefined;
-        const metaRaw = typeof flags["metadata"] === "string" ? flags["metadata"] : undefined;
-        const metadata = metaRaw ? (JSON.parse(metaRaw) as Record<string, unknown>) : undefined;
+        const content = getStringFlag(flags, "content");
+        const category = getStringFlag(flags, "category");
+        const tags = parseCsv(getStringFlag(flags, "tags"));
+        const metadataRaw = getStringFlag(flags, "metadata");
+        const metadata = metadataRaw ? parseJsonObject(metadataRaw, {}) : undefined;
 
         if (!content && !category && !tags && !metadata) {
-          console.error("Error: debes especificar al menos --content, --category, --tags o --metadata.");
-          process.exit(1);
+          die("debes especificar al menos --content, --category, --tags o --metadata.");
         }
 
         const updated = db.update(id, { content, category, tags, metadata });
-        if (!updated) { console.error("Error: no se pudo actualizar."); process.exit(1); }
+        if (!updated) die("no se pudo actualizar.");
 
         if (asJson) { output(updated); break; }
         console.log(`\n  ✓ Memoria actualizada\n`);
@@ -330,12 +364,11 @@ async function main(): Promise<void> {
       // ── delete ────────────────────────────────────────────────────────────
       case "delete": {
         const id = positional[0];
-        if (!id) { console.error("Error: se requiere un ID."); process.exit(1); }
+        if (!id) die("se requiere un ID.");
 
         const memory = db.getById(id);
         if (!memory || (project && memory.project !== project)) {
-          console.error(`Error: memoria '${id}' no encontrada${project ? ` en proyecto '${project}'` : ""}.`);
-          process.exit(1);
+          die(`memoria '${id}' no encontrada${project ? ` en proyecto '${project}'` : ""}.`);
         }
 
         if (!flags["yes"]) {
@@ -379,8 +412,7 @@ async function main(): Promise<void> {
       // ── backup ────────────────────────────────────────────────────────────
       case "backup": {
         if (db.dbPath === ":memory:") {
-          console.error("Error: no se puede hacer backup de una base de datos en memoria.");
-          process.exit(1);
+          die("no se puede hacer backup de una base de datos en memoria.");
         }
         const { copyFileSync, statSync } = await import("node:fs");
         const { dirname, join } = await import("node:path");
@@ -402,7 +434,7 @@ async function main(): Promise<void> {
       case "link": {
         const fromId = positional[0];
         const toId = positional[1];
-        if (!fromId || !toId) { console.error("Error: se requieren <from_id> y <to_id>."); process.exit(1); }
+        if (!fromId || !toId) die("se requieren <from_id> y <to_id>.");
 
         const relation = (typeof flags["relation"] === "string" && RELATION_TYPES.has(flags["relation"]))
           ? (flags["relation"] as RelationType)
@@ -418,7 +450,7 @@ async function main(): Promise<void> {
       case "unlink": {
         const fromId = positional[0];
         const toId = positional[1];
-        if (!fromId || !toId) { console.error("Error: se requieren <from_id> y <to_id>."); process.exit(1); }
+        if (!fromId || !toId) die("se requieren <from_id> y <to_id>.");
 
         const removed = db.unlinkMemories(fromId, toId);
         if (asJson) { output({ removed, from_id: fromId, to_id: toId }); break; }
@@ -459,13 +491,13 @@ async function main(): Promise<void> {
       // ── get-related-deep ────────────────────────────────────────────────
       case "get-related-deep": {
         const id = positional[0];
-        if (!id) { console.error("Error: se requiere un ID de origen."); process.exit(1); }
+        if (!id) die("se requiere un ID de origen.");
 
-        const max_depth = flags["max-depth"] ? parseInt(str(flags["max-depth"]), 10) : 3;
+        const max_depth = getIntFlag(flags, "max-depth", 3, "--max-depth");
         const relation = (typeof flags["relation"] === "string" && RELATION_TYPES.has(flags["relation"]))
           ? (flags["relation"] as RelationType)
           : undefined;
-        const limit = flags["limit"] ? parseInt(str(flags["limit"]), 10) : 50;
+        const limit = getIntFlag(flags, "limit", 50, "--limit");
 
         const result = db.getRelatedDeep({ id, max_depth, relation, project, limit });
         if (asJson) { output(result); break; }
@@ -483,7 +515,7 @@ async function main(): Promise<void> {
       // ── suggest-links ───────────────────────────────────────────────────
       case "suggest-links": {
         const id = positional[0];
-        const limit = flags["limit"] ? parseInt(str(flags["limit"]), 10) : 20;
+        const limit = getIntFlag(flags, "limit", 20, "--limit");
 
         const result = db.suggestLinks({ id, project, limit });
         if (asJson) { output(result); break; }
@@ -501,13 +533,12 @@ async function main(): Promise<void> {
       // ── history ───────────────────────────────────────────────────────────
       case "history": {
         const id = positional[0];
-        if (!id) { console.error("Error: se requiere un ID."); process.exit(1); }
+        if (!id) die("se requiere un ID.");
 
-        const limit = flags["limit"] ? parseInt(str(flags["limit"]), 10) : 20;
+        const limit = getIntFlag(flags, "limit", 20, "--limit");
         const memory = db.getById(id);
         if (!memory || (project && memory.project !== project)) {
-          console.error(`Error: memoria '${id}' no encontrada${project ? ` en proyecto '${project}'` : ""}.`);
-          process.exit(1);
+          die(`memoria '${id}' no encontrada${project ? ` en proyecto '${project}'` : ""}.`);
         }
 
         const result = db.getHistory({ memory_id: id, project, limit, offset: 0 });
@@ -531,25 +562,26 @@ async function main(): Promise<void> {
         const id = positional[0];
         const histId = positional[1];
         if (!id || !histId) {
-          console.error("Error: se requieren <memory_id> y <history_id>.");
-          process.exit(1);
+          die("se requieren <memory_id> y <history_id>.");
         }
 
         const memory = db.getById(id);
         if (!memory || (project && memory.project !== project)) {
-          console.error(`Error: memoria '${id}' no encontrada${project ? ` en proyecto '${project}'` : ""}.`);
-          process.exit(1);
+          die(`memoria '${id}' no encontrada${project ? ` en proyecto '${project}'` : ""}.`);
         }
 
-        const restored = db.restoreMemory({ memory_id: id, history_id: parseInt(histId, 10) });
+        const parsedHistoryId = parseInt(histId, 10);
+        if (Number.isNaN(parsedHistoryId)) {
+          die("<history_id> debe ser un número entero válido.");
+        }
+
+        const restored = db.restoreMemory({ memory_id: id, history_id: parsedHistoryId });
         if (!restored) {
-          console.error(`Error: no se encontró la memoria o la entrada de historial.`);
-          process.exit(1);
+          die("no se encontró la memoria o la entrada de historial.");
         }
 
         if (project && restored.project !== project) {
-          console.error(`Error: no se pudo restaurar la memoria en el proyecto '${project}'.`);
-          process.exit(1);
+          die(`no se pudo restaurar la memoria en el proyecto '${project}'.`);
         }
 
         if (asJson) { output(restored); break; }
@@ -578,12 +610,10 @@ async function main(): Promise<void> {
         const sourceProject = positional[1];
         const targetProject = positional[2];
         if (!tag || !sourceProject || !targetProject) {
-          console.error("Error: se requieren <tag> <source_project> y <project>.");
-          process.exit(1);
+          die("se requieren <tag> <source_project> y <project>.");
         }
         if (sourceProject === targetProject) {
-          console.error("Error: <source_project> y <project> deben ser distintos.");
-          process.exit(1);
+          die("<source_project> y <project> deben ser distintos.");
         }
 
         const migrated = db.migrateToProject({ tag, source_project: sourceProject, project: targetProject });
