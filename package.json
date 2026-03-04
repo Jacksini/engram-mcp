@@ -1,6 +1,6 @@
 {
   "name": "engram-mcp",
-  "version": "1.0.0",
+  "version": "1.1.1",
   "description": "Persistent memory server for AI agents — MCP server with FTS5, graph relations, change history and CLI.",
   "main": "index.js",
   "keywords": [

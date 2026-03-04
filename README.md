@@ -122,8 +122,8 @@ COMMANDS
   history <id>                Change history for a memory (--limit)
   restore <id> <history_id>   Restore a memory to a previous version
   list-projects               List projects with memory counts
-  migrate-to-project <tag> <project>
-                              Move memories with a specific tag to another project
+  migrate-to-project <tag> <source_project> <project>
+                              Move memories with a specific tag from source to target project
   help                        Show help
 ```
 
@@ -154,7 +154,7 @@ engram-cli suggest-links abc12345-... --limit 10
 
 # Project utilities
 engram-cli list-projects
-engram-cli migrate-to-project engram-mcp engram-mcp
+engram-cli migrate-to-project engram-mcp default engram-mcp
 
 # See history of a memory and restore a version
 engram-cli history abc12345-...

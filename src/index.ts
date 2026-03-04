@@ -7,7 +7,7 @@ import { registerAllTools } from "./tools/register-all.js";
 
 const server = new McpServer({
   name: "engram-mcp",
-  version: "1.0.0",
+  version: "1.1.1",
 });
 
 const db = new MemoryDatabase();
