@@ -25,7 +25,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: "restore_memory", group: "Update", purpose: "Restore memory from history" },
   { name: "rename_tag", group: "Update", purpose: "Rename a tag globally" },
   { name: "update_link", group: "Update", purpose: "Update relation type of an existing link" },
-  { name: "migrate_to_project", group: "Update", purpose: "Move memories by tag to another project" },
+  { name: "migrate_to_project", group: "Update", purpose: "Move memories by tag from a source project to another project" },
 
   { name: "delete_memory", group: "Delete", purpose: "Delete a single memory" },
   { name: "delete_memories", group: "Delete", purpose: "Delete multiple memories" },
