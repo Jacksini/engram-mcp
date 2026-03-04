@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { MemoryDatabase } from "../db/database.js";
-import { CategoryEnum, CompactParams, SortByParam, ProjectParam } from "./schemas.js";
+import { CategoryEnum, CompactParams, SortByParam, ProjectParam, DateRangeParams } from "./schemas.js";
 
 export function registerListMemories(server: McpServer, db: MemoryDatabase): void {
   server.tool(
@@ -24,22 +24,7 @@ export function registerListMemories(server: McpServer, db: MemoryDatabase): voi
         .optional()
         .describe("Offset para paginación (>= 0)"),
       sort_by: SortByParam,
-      created_after: z
-        .string()
-        .optional()
-        .describe("ISO datetime. Solo memorias creadas en o después de esta fecha."),
-      created_before: z
-        .string()
-        .optional()
-        .describe("ISO datetime. Solo memorias creadas en o antes de esta fecha."),
-      updated_after: z
-        .string()
-        .optional()
-        .describe("ISO datetime. Solo memorias actualizadas en o después de esta fecha."),
-      updated_before: z
-        .string()
-        .optional()
-        .describe("ISO datetime. Solo memorias actualizadas en o antes de esta fecha."),
+      ...DateRangeParams,
       metadata_key: z
         .string()
         .optional()

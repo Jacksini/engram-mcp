@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { CategoryEnum, SortByParam } from "../../src/tools/schemas.js";
+import {
+  CategoryEnum,
+  SortByParam,
+  OptionalIsoDateTimeParam,
+  OptionalNullableIsoDateTimeParam,
+  DateRangeParams,
+} from "../../src/tools/schemas.js";
 
 describe("CategoryEnum Zod schema", () => {
   it("accepts all valid categories", () => {
@@ -36,5 +42,32 @@ describe("SortByParam Zod schema", () => {
 
   it("accepts undefined (optional field)", () => {
     expect(SortByParam.parse(undefined)).toBeUndefined();
+  });
+});
+
+describe("ISO datetime schemas", () => {
+  it("accepts valid ISO datetime with Z suffix", () => {
+    const value = "2026-03-03T10:30:45Z";
+    expect(OptionalIsoDateTimeParam.parse(value)).toBe(value);
+  });
+
+  it("accepts valid ISO datetime with timezone offset", () => {
+    const value = "2026-03-03T10:30:45+02:00";
+    expect(OptionalIsoDateTimeParam.parse(value)).toBe(value);
+  });
+
+  it("rejects non-ISO datetime strings", () => {
+    expect(() => OptionalIsoDateTimeParam.parse("2026-03-03 10:30:45")).toThrow();
+    expect(() => OptionalIsoDateTimeParam.parse("not-a-date")).toThrow();
+  });
+
+  it("nullable ISO schema accepts null and undefined", () => {
+    expect(OptionalNullableIsoDateTimeParam.parse(null)).toBeNull();
+    expect(OptionalNullableIsoDateTimeParam.parse(undefined)).toBeUndefined();
+  });
+
+  it("DateRangeParams validate each range field as ISO datetime", () => {
+    expect(DateRangeParams.created_after.parse("2026-03-03T10:30:45Z")).toBe("2026-03-03T10:30:45Z");
+    expect(() => DateRangeParams.updated_before.parse("2026-03-03")).toThrow();
   });
 });

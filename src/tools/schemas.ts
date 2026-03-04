@@ -1,6 +1,17 @@
 import { z } from "zod";
 import { VALID_CATEGORIES } from "../types/memory.js";
 
+const ISO_DATETIME_VALIDATION_MESSAGE =
+  "Debe ser un ISO datetime válido con zona horaria (ej. 2025-12-31T23:59:59Z).";
+
+export const IsoDateTimeParam = z
+  .string()
+  .datetime({ offset: true, message: ISO_DATETIME_VALIDATION_MESSAGE });
+
+export const OptionalIsoDateTimeParam = IsoDateTimeParam.optional();
+
+export const OptionalNullableIsoDateTimeParam = IsoDateTimeParam.nullable().optional();
+
 // ---------------------------------------------------------------------------
 // Category enum — enforces the 6 known categories at the tool (Zod) layer.
 // The DB layer still accepts any string (normalises to lowercase).
@@ -35,7 +46,7 @@ export const MemoryInputSchema = z.object({
   category: CategoryEnum,
   tags: z.array(z.string()).optional().describe("Tags para filtrado"),
   metadata: z.record(z.unknown()).optional().describe("Datos estructurados adicionales"),
-  expires_at: z.string().nullable().optional()
+  expires_at: OptionalNullableIsoDateTimeParam
     .describe("ISO datetime para expiración automática (ej. 2025-12-31T23:59:59Z). null = sin expiración."),
 });
 
@@ -47,9 +58,20 @@ export const UpdateFieldsSchema = z.object({
   category: CategoryEnum,
   tags: z.array(z.string()).optional().describe("Nuevos tags"),
   metadata: z.record(z.unknown()).optional().describe("Nueva metadata"),
-  expires_at: z.string().nullable().optional()
+  expires_at: OptionalNullableIsoDateTimeParam
     .describe("ISO datetime de expiración. null = eliminar expiración. Omitir = sin cambio."),
 });
+
+export const DateRangeParams = {
+  created_after: OptionalIsoDateTimeParam
+    .describe("ISO datetime. Solo memorias creadas en o después de esta fecha."),
+  created_before: OptionalIsoDateTimeParam
+    .describe("ISO datetime. Solo memorias creadas en o antes de esta fecha."),
+  updated_after: OptionalIsoDateTimeParam
+    .describe("ISO datetime. Solo memorias actualizadas en o después de esta fecha."),
+  updated_before: OptionalIsoDateTimeParam
+    .describe("ISO datetime. Solo memorias actualizadas en o antes de esta fecha."),
+};
 
 // ---------------------------------------------------------------------------
 // Schema for a single item in update_memories (id + at least one field)
