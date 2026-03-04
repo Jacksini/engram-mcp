@@ -1643,13 +1643,19 @@ export class MemoryDatabase {
    * Returns the number of memories updated.
    */
   migrateToProject(input: MigrateToProjectInput): number {
-    const { tag, project } = input;
+    const { tag, source_project, project } = input;
+
+    if (source_project === project) {
+      return 0;
+    }
+
     const rows = this.db.prepare(
       `UPDATE memories
        SET project = ?, updated_at = datetime('now')
-       WHERE EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE value = ?)
+       WHERE project = ?
+         AND EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE value = ?)
        RETURNING id`
-    ).all(project, tag) as Array<{ id: string }>;
+    ).all(project, source_project, tag) as Array<{ id: string }>;
     return rows.length;
   }
 

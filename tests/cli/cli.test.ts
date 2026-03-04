@@ -77,6 +77,6 @@ describe("CLI help text", () => {
     expect(help).toContain("get-related-deep <id>");
     expect(help).toContain("suggest-links [id]");
     expect(help).toContain("list-projects");
-    expect(help).toContain("migrate-to-project <tag> <project>");
+    expect(help).toContain("migrate-to-project <tag> <source_project> <project>");
   });
 });

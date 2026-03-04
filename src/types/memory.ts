@@ -403,5 +403,6 @@ export interface ProjectInfo {
 
 export interface MigrateToProjectInput {
   tag: string;
+  source_project: string;
   project: string;
 }

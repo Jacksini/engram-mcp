@@ -188,8 +188,8 @@ COMMANDS
 
   list-projects               Listar proyectos y conteo de memorias
 
-  migrate-to-project <tag> <project>
-                              Mover memorias con el tag al proyecto destino
+  migrate-to-project <tag> <source_project> <project>
+                              Mover memorias con el tag desde proyecto origen al proyecto destino
 
   help                        Mostrar esta ayuda
 `;
@@ -575,17 +575,24 @@ async function main(): Promise<void> {
       // ── migrate-to-project ──────────────────────────────────────────────
       case "migrate-to-project": {
         const tag = positional[0];
-        const targetProject = positional[1];
-        if (!tag || !targetProject) {
-          console.error("Error: se requieren <tag> y <project>.");
+        const sourceProject = positional[1];
+        const targetProject = positional[2];
+        if (!tag || !sourceProject || !targetProject) {
+          console.error("Error: se requieren <tag> <source_project> y <project>.");
+          process.exit(1);
+        }
+        if (sourceProject === targetProject) {
+          console.error("Error: <source_project> y <project> deben ser distintos.");
           process.exit(1);
         }
 
-        const migrated = db.migrateToProject({ tag, project: targetProject });
-        const payload = { migrated, tag, project: targetProject };
+        const migrated = db.migrateToProject({ tag, source_project: sourceProject, project: targetProject });
+        const payload = { migrated, tag, source_project: sourceProject, project: targetProject };
         if (asJson) { output(payload); break; }
 
-        console.log(`\n  ✓ Migradas ${migrated} memorias con tag '${tag}' al proyecto '${targetProject}'\n`);
+        console.log(
+          `\n  ✓ Migradas ${migrated} memorias con tag '${tag}' desde '${sourceProject}' al proyecto '${targetProject}'\n`
+        );
         break;
       }
 

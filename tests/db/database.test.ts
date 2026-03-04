@@ -508,4 +508,35 @@ describe("MemoryDatabase", () => {
       expect(total).toBe(1);
     });
   });
+
+  describe("migrateToProject", () => {
+    it("moves only memories from source project that contain the tag", () => {
+      const sourceTagged = db.create({ content: "source tagged", tags: ["inventra"], project: "default" });
+      const sourceOtherTag = db.create({ content: "source other", tags: ["other"], project: "default" });
+      const otherProjectTagged = db.create({ content: "other project tagged", tags: ["inventra"], project: "legacy" });
+
+      const migrated = db.migrateToProject({
+        tag: "inventra",
+        source_project: "default",
+        project: "inventra",
+      });
+
+      expect(migrated).toBe(1);
+      expect(db.getById(sourceTagged.id)!.project).toBe("inventra");
+      expect(db.getById(sourceOtherTag.id)!.project).toBe("default");
+      expect(db.getById(otherProjectTagged.id)!.project).toBe("legacy");
+    });
+
+    it("returns 0 when source and destination are the same project", () => {
+      db.create({ content: "same project", tags: ["inventra"], project: "default" });
+
+      const migrated = db.migrateToProject({
+        tag: "inventra",
+        source_project: "default",
+        project: "default",
+      });
+
+      expect(migrated).toBe(0);
+    });
+  });
 });
