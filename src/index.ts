@@ -14,10 +14,17 @@ const db = new MemoryDatabase();
 registerAllTools(server, db);
 
 async function main() {
+  console.error(`Starting engram-mcp (db='${db.dbPath}', default_project='${db.defaultProject}')`);
+
   // Purge expired memories on startup so TTL-based entries are cleaned up immediately
-  const purged = db.purgeExpired();
-  if (purged.purged > 0) {
-    console.error(`Auto-purge: ${purged.purged} expired memor${purged.purged === 1 ? "y" : "ies"} removed on startup.`);
+  try {
+    const purged = db.purgeExpired();
+    if (purged.purged > 0) {
+      console.error(`Auto-purge: ${purged.purged} expired memor${purged.purged === 1 ? "y" : "ies"} removed on startup.`);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Auto-purge failed on startup: ${message}`);
   }
 
   const transport = new StdioServerTransport();
@@ -26,14 +33,25 @@ async function main() {
 
   // Periodic maintenance (4.1): purge expired every 5 min, optimize FTS every 30 min
   const purgeInterval = setInterval(() => {
-    const result = db.purgeExpired();
-    if (result.purged > 0) {
-      console.error(`Periodic purge: ${result.purged} expired memor${result.purged === 1 ? "y" : "ies"} removed.`);
+    try {
+      const result = db.purgeExpired();
+      if (result.purged > 0) {
+        console.error(`Periodic purge: ${result.purged} expired memor${result.purged === 1 ? "y" : "ies"} removed.`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`Periodic purge failed: ${message}`);
     }
   }, 5 * 60 * 1000);
 
   const ftsInterval = setInterval(() => {
-    db.optimizeFts();
+    try {
+      db.optimizeFts();
+      console.error("FTS optimize executed.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`FTS optimize failed: ${message}`);
+    }
   }, 30 * 60 * 1000);
 
   // Graceful shutdown: clear intervals and close the DB so SQLite can flush the WAL

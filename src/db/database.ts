@@ -492,8 +492,11 @@ export class MemoryDatabase {
     if (input.auto_link !== false) {
       try {
         this.autoLink(memory);
-      } catch {
-        // Auto-link failures must never surface to the caller
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(
+          `[auto-link] Warning: failed to infer links for memory ${memory.id} (project='${memory.project}'): ${message}`
+        );
       }
     }
 
